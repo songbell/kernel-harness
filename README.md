@@ -4,6 +4,9 @@ Measurement, verification and calibration harness for Intel CM (C-for-Metal) GPU
 Kernels stay in their own repos; this repo holds the **method**, the **tooling** and the
 **findings**.
 
+New to this? **`docs/ONBOARDING.md`** is the step-by-step path for optimizing a kernel you
+did not write, including which steps have tool support today and which are still manual.
+
 ## Quickstart
 
 ```bash
