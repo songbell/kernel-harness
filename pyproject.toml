@@ -1,0 +1,16 @@
+[project]
+name = "cm-kernel-harness"
+version = "0.1.0"
+description = "Measurement, verification and calibration harness for Intel CM GPU kernels"
+requires-python = ">=3.11"
+
+[project.scripts]
+ckh = "ckh.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["ckh"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,28 @@
+# Copy to platform.toml and edit. This is the ONLY machine-specific file in the repo.
+# `ckh doctor` validates it.
+
+[exec]
+# Where measurements run. "local" is the default and the only backend the core needs.
+# Other backends are environment-specific remedies, not part of the method -- see
+# docs/unstable-rigs.md if your box cannot hold a stable clock.
+backend = "local"
+
+# Only needed if the CM frontend (libclangFEWrapper.so) is not already on the loader path.
+ld_library_path = ""
+
+[repos]
+# Kernel sources stay in their own repos; the harness never forks them.
+sandbox = "/path/to/aboutSHW"
+production = "/path/to/openvino"
+
+# Directory the sandbox tests import from (clops, test helpers).
+sandbox_pythonpath = ["opencl", "opencl/tests/pageatten"]
+
+[rig]
+# A measured effect smaller than this is reported as "not resolvable", never as a result.
+# `ckh doctor` measures the actual spread and warns if it exceeds this.
+noise_floor_pct = 2.0
+
+# Rounds per config. Configs are interleaved round-by-round and the MINIMUM is reported:
+# sequential A-then-B charges B for A's heat.
+rounds = 3
