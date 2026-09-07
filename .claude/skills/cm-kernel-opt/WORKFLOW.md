@@ -24,6 +24,16 @@ the boxes: most of the value is in *not* proceeding.
                                             │
                                             ▼
                      ┌──────────────────────────────────────────────┐
+                     │  1b ckh kernelgen            *** OPTIONAL *** │
+                     │     only if the profiled kernel has no        │
+                     │     sandbox copy yet. plugin .cm ──► sandbox  │
+                     │     DERIVED sig/includes/-D · GUESS host jit  │
+                     │     REFUSED inputs (test skips its launch)    │
+                     └──────────────────────┬───────────────────────┘
+                          already have one ─┴─► skip; point kernels/<n>.py at it
+                                            │
+                                            ▼
+                     ┌──────────────────────────────────────────────┐
                      │  1  roofline-analyst                         │
                      │     MEASURED roofs (never spec sheets)       │
                      │     compulsory traffic vs algorithm artifact │
@@ -47,6 +57,8 @@ the boxes: most of the value is in *not* proceeding.
                      │     ablation budget, largest term first      │
                      │     self-check: probe cheaper than removed?  │
                      │     self-check: probe-off == baseline?       │
+                     │  (ckh kernel-profile ranks candidates first, │
+                     │   from the IGC dump, at no GPU cost)         │
                      └──────────────────────┬───────────────────────┘
                                             ▼
     ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -59,8 +71,10 @@ the boxes: most of the value is in *not* proceeding.
     ║        implement ──► equivalence-prover ──► measure ──► adopt             ║
     ║                            │                   │                          ║
     ║                    non-vacuous? ─ no ─►        │ no gain ─► REJECT        ║
-    ║                    fix the TEST                │                          ║
-    ╚════════════════════════════════════╤══════════════════════════════════════╝
+    ║                    fix the TEST                │                          ║    ║                                                                           ║
+    ║  ckh trial automates the bookkeeping: budgeted tree, per-node snapshot,    ║
+    ║  gates in cost order, and a finalize that RE-MEASURES rather than trusting ║
+    ║  stored deltas (they came from different moments on a drifting box).       ║    ╚════════════════════════════════════╤══════════════════════════════════════╝
                                          ▼
                      ┌──────────────────────────────────────────────┐
                      │  5  range-tuner                              │
@@ -137,7 +151,10 @@ provisional: it drifts ~2x within a session.
 flowchart TD
     T[task] --> P[P pre-profiler: cl_intercept e2e]
     P -->|kernel share too small| STOP2[STOP: Amdahl ceiling]
-    P --> W[0 rig-warden]
+    P --> KG{sandbox kernel exists?}
+    KG -->|no| GEN[ckh kernelgen: plugin .cm to sandbox]
+    KG -->|yes| W[0 rig-warden]
+    GEN --> W
     T -->|target kernel already fixed| W
     W -->|noise >= effect| STOP[STOP: not resolvable]
     W --> R[1 roofline-analyst]
@@ -145,6 +162,8 @@ flowchart TD
     R -->|gap > 3x| A
     R -->|gap 1.5-3x| B[3 budget-prober]
     A -->|redesign / re-policy| B
+    KPF[ckh kernel-profile: pipe-cycle hypotheses] --> B
+    R --> KPF
     B --> L{4 loop: per candidate}
     L --> C[bitexact-classifier]
     C -->|not bit-exact| U[ask user: max_diff distribution]
@@ -154,7 +173,9 @@ flowchart TD
     E -->|vacuous| E2[fix the test] --> E
     E --> M[measure]
     M -->|no gain| REJ[reject + ledger] --> L
-    M -->|gain| RT[5 range-tuner]
+    M -->|gain| FIN[ckh trial finalize: re-measure shortlist + baseline]
+    FIN -->|fresh measurement contradicts stored deltas| REJ
+    FIN --> RT[5 range-tuner]
     RT --> IN[6 integrator: aboutSHW to openvino]
     IN --> LG[ledger in both kernels]
 ```

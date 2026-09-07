@@ -62,3 +62,9 @@ pipeline = []
 
 # Extra environment for that command only (driver knobs, PYTHONPATH for an out-of-tree build).
 # pipeline_env = { PYTHONPATH = "/opt/ov/python" }
+
+[kernelgen]
+# Where `ckh kernelgen` lands a kernel ported out of the plugin, relative to repos.sandbox.
+# It also becomes the spec's `cwd`, so the generated test and the measurement subprocess
+# agree on where the .cm and its copied includes are.
+dest = "opencl/tests/pageatten"

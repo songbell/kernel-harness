@@ -40,6 +40,8 @@ class Platform:
     clops_path: str | None
     noise_floor_pct: float
     rounds: int
+    # Where `ckh kernelgen` drops a kernel ported out of the plugin, relative to `sandbox`.
+    kernelgen_dest: str
     raw: dict = field(default_factory=dict)
 
     @classmethod
@@ -60,6 +62,7 @@ class Platform:
             sandbox_pythonpath=d["repos"].get("sandbox_pythonpath", []),
             noise_floor_pct=float(d.get("rig", {}).get("noise_floor_pct", 2.0)),
             rounds=int(d.get("rig", {}).get("rounds", 3)),
+            kernelgen_dest=d.get("kernelgen", {}).get("dest", "opencl/tests/pageatten"),
             raw=d,
         )
 

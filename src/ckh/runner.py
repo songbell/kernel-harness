@@ -19,8 +19,17 @@ def _load_spec(name: str):
     return importlib.import_module(f"kernels.{name}").SPEC
 
 
-def _time_one(spec, shape, overrides, loops: int, warmup: int, source: str) -> float:
-    """Mean ms over the post-warmup enqueues of one config."""
+def _time_one(spec, shape, overrides, loops: int, warmup: int, source: str) -> tuple[float, float]:
+    """(device_ms, wall_ms), both per post-warmup enqueue.
+
+    Two numbers because they answer different questions and get confused constantly. The
+    device time is what the kernel costs; the wall time additionally carries host submission
+    overhead and whatever the queue did not overlap. A kernel that is 3x off its roofline but
+    whose wall time barely exceeds its device time has no host-side problem to find, and one
+    where they diverge has a dispatch cost that no amount of kernel micro-optimisation touches.
+    """
+    import time
+
     from clops import cl
 
     data = spec.inputs(shape)                      # cached per shape by the spec
@@ -29,10 +38,12 @@ def _time_one(spec, shape, overrides, loops: int, warmup: int, source: str) -> f
                          f"{opts} {spec.defines(shape, overrides)}")
     gws, lws = spec.dispatch(shape)
 
+    t0 = time.perf_counter()
     for i in range(loops):
         outs = spec.outputs(shape) if spec.outputs else {}
         kernels.enqueue(spec.entry, gws, lws, *spec.args(shape, data, outs))
     lat = cl.finish()
+    wall_ms = (time.perf_counter() - t0) * 1e3
 
     tot = n = 0
     for i, ns in enumerate(lat[:loops]):
@@ -41,7 +52,10 @@ def _time_one(spec, shape, overrides, loops: int, warmup: int, source: str) -> f
             n += 1
     if not n:
         raise RuntimeError("no valid profiling events")
-    return tot * 1e-6 / n
+    # Wall time covers the warmup enqueues too; there is no per-enqueue host timestamp to
+    # exclude them with, so divide by the full loop count and say so rather than pretending
+    # the two averages are over the same set.
+    return tot * 1e-6 / n, wall_ms / loops
 
 
 def main() -> None:
@@ -63,6 +77,7 @@ def main() -> None:
     configs = json.loads(a.configs)
 
     samples: dict[str, list[float]] = {c["label"]: [] for c in configs}
+    walls: dict[str, list[float]] = {c["label"]: [] for c in configs}
     err: dict[str, str] = {}
     # Round-robin, not config-by-config: sequential ordering charges the second config for
     # the first one's heat, which on an unstable box can invert an A/B outright.
@@ -72,9 +87,10 @@ def main() -> None:
                 continue
             try:
                 shape = Shape(c["shape"])
-                samples[c["label"]].append(
-                    _time_one(spec, shape, c.get("overrides") or {}, a.loops, a.warmup,
-                              c.get("source") or default_source))
+                dev, wall = _time_one(spec, shape, c.get("overrides") or {}, a.loops,
+                                      a.warmup, c.get("source") or default_source)
+                samples[c["label"]].append(dev)
+                walls[c["label"]].append(wall)
             except Exception as e:                      # noqa: BLE001 - report, don't abort
                 err[c["label"]] = f"{type(e).__name__}: {e}"[:300]
 
@@ -84,7 +100,8 @@ def main() -> None:
             out[label] = {"error": err[label]}
         elif xs:
             out[label] = {"min_ms": min(xs), "max_ms": max(xs), "n": len(xs),
-                          "spread_pct": (max(xs) / min(xs) - 1.0) * 100.0}
+                          "spread_pct": (max(xs) / min(xs) - 1.0) * 100.0,
+                          "wall_ms": min(walls[label]) if walls[label] else None}
     print(RESULT_PREFIX + json.dumps(out))
 
 

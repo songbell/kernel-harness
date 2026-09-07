@@ -48,15 +48,31 @@ floor. *Nothing below this line is trustworthy without it.*
 traffic from algorithm artifacts, report `current / floor`.
 → gap < 1.2× : go to phase 2 only. gap 1.5–3× : continue to phase 3. gap > 3× : phase 2 first.
 
+**1b. `ckh kernelgen` (OPTIONAL)** — only when the kernel `profile` named has no sandbox copy
+yet. Ports the plugin `.cm` plus its include closure into the sandbox and scaffolds a spec
+and a compile test. It derives the signature and the full `-D` list, marks anything lifted
+from host C++ as a GUESS, and refuses to invent input data. **Skip it** if you already have a
+sandbox kernel path — then just point `kernels/<name>.py` at it.
+
 **2. `algorithm-critic`** — is this decomposition right *for this shape*? Especially when a
 traffic term turned out to be an artifact, or when performance swings across shapes.
 
 **3. `budget-prober`** — ablation-decompose the implementation into a measured budget. Attack
 terms by measured size, never by plausibility.
 
+`ckh kernel-profile` is the cheap first pass at the same question: a pipe-cycle budget from
+the IGC dump, with no GPU time spent. It ranks *hypotheses*; ablation is what turns one into
+a measured term. Use it to choose what to ablate, never as the budget itself.
+
 **4. Optimization loop**, per candidate:
    `bitexact-classifier` → implement → `equivalence-prover` → measure → ledger.
    Reject on measurement, not on taste. Record negatives with their numbers.
+
+`ckh trial` is this loop with the bookkeeping automated: a branching tree with a budget, each
+node pinning its own source snapshot, gates run in cost order (validate → equiv → bench). Its
+`finalize` re-measures the shortlist against the baseline in ONE interleaved batch — stored
+per-trial deltas came from different moments on a drifting box and are not comparable, so
+they shortlist and never rank.
 
 **5. `range-tuner`** — any constant that changed must be calibrated across its whole domain
 and shipped with a machine-independent, bidirectionally-verified regression guard.

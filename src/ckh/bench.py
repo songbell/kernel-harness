@@ -65,7 +65,10 @@ def render(results: dict, noise_floor_pct: float) -> str:
         if v["spread_pct"] > noise_floor_pct:
             flag = "  <- spread exceeds noise floor"
             unstable.append(label)
-        rows.append(f"{label:<{w}}  {v['min_ms']:8.3f} ms  spread {v['spread_pct']:5.1f}%"
+        # Device time is the headline; wall time next to it is the only way to see host
+        # submission cost, which no amount of kernel work removes.
+        wall = f"  wall {v['wall_ms']:7.3f} ms" if v.get("wall_ms") else ""
+        rows.append(f"{label:<{w}}  {v['min_ms']:8.3f} ms{wall}  spread {v['spread_pct']:5.1f}%"
                     f"  n={v['n']}{flag}")
     out = "\n".join(rows)
     if unstable:
@@ -73,6 +76,31 @@ def render(results: dict, noise_floor_pct: float) -> str:
                 f"Differences smaller than the spread are NOT resolvable -- fix the rig "
                 f"before drawing conclusions.")
     return out
+
+
+def pair_by_shape(results: dict, base_name: str, new_name: str) -> dict[str, tuple[dict, dict]]:
+    """shape -> (baseline, candidate), for every shape where both sides measured.
+
+    Shared by `render_round` and `ckh trial`'s bench gate so the two cannot drift apart on
+    what counts as a comparable pair.
+    """
+    shapes: dict[str, dict[str, dict]] = {}
+    for label, v in results.items():
+        if "error" in v:
+            continue
+        shape, _, variant = label.rpartition(" | ")
+        shapes.setdefault(shape, {})[variant] = v
+    return {s: (v[base_name], v[new_name]) for s, v in shapes.items()
+            if base_name in v and new_name in v}
+
+
+def round_deltas(results: dict, base_name: str, new_name: str,
+                 noise_pct: float) -> dict[str, tuple[float, float]]:
+    """shape -> (delta_pct, resolution_pct). The run-to-run spread bounds what a comparison
+    can resolve, and the configured noise floor is a lower bound on that."""
+    return {s: ((n["min_ms"] / b["min_ms"] - 1.0) * 100.0,
+                max(b["spread_pct"], n["spread_pct"], noise_pct))
+            for s, (b, n) in pair_by_shape(results, base_name, new_name).items()}
 
 
 def render_round(results: dict, base_name: str, new_name: str, noise_pct: float) -> tuple[str, int]:
@@ -87,23 +115,14 @@ def render_round(results: dict, base_name: str, new_name: str, noise_pct: float)
     it as the latter is how a real 5% regression gets waved through -- observed while testing
     this very function on a drifting host.
     """
-    shapes: dict[str, dict[str, dict]] = {}
-    for label, v in results.items():
-        if "error" in v:
-            continue
-        shape, _, variant = label.rpartition(" | ")
-        shapes.setdefault(shape, {})[variant] = v
+    pairs = pair_by_shape(results, base_name, new_name)
+    deltas = round_deltas(results, base_name, new_name, noise_pct)
 
-    w = max((len(s) for s in shapes), default=6)
+    w = max((len(s) for s in pairs), default=6)
     lines = [f"{'shape':<{w}}  {base_name:>9}  {new_name:>9}  {'delta':>8}  {'noise':>6}"]
     better = worse = unknown = 0
-    for shape, v in shapes.items():
-        if base_name not in v or new_name not in v:
-            continue
-        b, n = v[base_name], v[new_name]
-        d = (n["min_ms"] / b["min_ms"] - 1.0) * 100.0
-        # The run-to-run spread bounds what this comparison can resolve.
-        res = max(b["spread_pct"], n["spread_pct"], noise_pct)
+    for shape, (b, n) in pairs.items():
+        d, res = deltas[shape]
         if abs(d) <= res:
             tag, unknown = "  ? INCONCLUSIVE", unknown + 1
         elif d > 0:

@@ -69,6 +69,11 @@ class KernelSpec:
     reference: TorchReference | KernelReference | None = None
 
     build_options: Callable[[Shape], str] | None = None
+    # Kernel-specific rules `ckh validate` enforces before any GPU time. Each takes a Shape
+    # and returns None when satisfied, or a message describing the violation. They belong
+    # here rather than in the validator because they are facts about ONE kernel -- pa_small_q's
+    # `Q_head_chunk_size * TILE_Q <= 8` is a DPAS RepeatCount cap and means nothing elsewhere.
+    constraints: list[Callable[[Shape], str | None]] = field(default_factory=list)
     # Working directory for the measurement subprocess, relative to platform.sandbox. None
     # falls back to Platform's historical default (opencl/tests/pageatten) -- override when a
     # kernel/reference pair lives elsewhere.
