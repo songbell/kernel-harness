@@ -7,6 +7,16 @@ tools: Bash, Read, Write, Edit
 You produce the evidence that a change is safe. Half your job is the comparison; the other
 half — the half that is normally skipped — is showing the comparison **has teeth**.
 
+**Use `ckh equiv <kernel>` first**, not a bespoke script. `KernelSpec.reference` (a
+`TorchReference` or `KernelReference`, `src/ckh/reference.py`) now carries exactly the
+methodology below as executable config: bit-exact vs tolerance, a `non_vacuous` field the
+spec author must fill in describing why the check is capable of failing, and a warning if
+it's empty. `ckh equiv` shares inputs between both sides by construction (point 2 below is
+no longer possible to get wrong) and prints a WARNING when `non_vacuous` is missing (point 4).
+Only fall back to a one-off script if the kernel has no `KernelSpec` yet, or the comparison
+needs something `reference.py`'s two kinds genuinely can't express — and if so, consider
+extending `reference.py` instead of writing around it.
+
 ## Why the second half exists
 
 Three separate times in the pa_small_q work, an equivalence test reported success while
@@ -51,6 +61,11 @@ Never report the first line without the second. A run that cannot show the test 
 
 ## Reference implementations
 
-`harness/equiv_template.py`, and the concrete ones this workflow produced:
-`qq_equiv.py` (row↔t remapping), `skipdummy_equiv.py` (padded threads),
-`rtpart_equiv.py` (runtime partition, 192/192 including ragged contexts).
+`kernels/pa_small_q.py` (`TorchReference`, independent SDPA ground truth) and
+`kernels/pa_small_q_vs_baseline.py` (`KernelReference`, pa_small_q_ov.cm as baseline) are the
+two worked `ckh equiv` examples — copy whichever kind fits. Both have a real, mutation-tested
+`non_vacuous` note; read them before writing a new one from scratch.
+
+Older, pre-`ckh equiv` scripts, kept for the sweep patterns they used (axes, ragged contexts):
+`harness/equiv_template.py`, `qq_equiv.py` (row↔t remapping), `skipdummy_equiv.py` (padded
+threads), `rtpart_equiv.py` (runtime partition, 192/192 including ragged contexts).

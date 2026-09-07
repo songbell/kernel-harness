@@ -30,7 +30,8 @@ def _time_one(spec, shape, overrides, loops: int, warmup: int, source: str) -> f
     gws, lws = spec.dispatch(shape)
 
     for i in range(loops):
-        kernels.enqueue(spec.entry, gws, lws, *spec.args(shape, data))
+        outs = spec.outputs(shape) if spec.outputs else {}
+        kernels.enqueue(spec.entry, gws, lws, *spec.args(shape, data, outs))
     lat = cl.finish()
 
     tot = n = 0
@@ -58,7 +59,7 @@ def main() -> None:
     spec = _load_spec(a.spec)
     # Resolve the source here rather than threading it through the config list: the runner is
     # already in the measurement environment, so it is the right place to know the paths.
-    source = str(Platform.load().sandbox / spec.source)
+    default_source = str(Platform.load().sandbox / spec.source)
     configs = json.loads(a.configs)
 
     samples: dict[str, list[float]] = {c["label"]: [] for c in configs}
@@ -72,7 +73,8 @@ def main() -> None:
             try:
                 shape = Shape(c["shape"])
                 samples[c["label"]].append(
-                    _time_one(spec, shape, c.get("overrides") or {}, a.loops, a.warmup, source))
+                    _time_one(spec, shape, c.get("overrides") or {}, a.loops, a.warmup,
+                              c.get("source") or default_source))
             except Exception as e:                      # noqa: BLE001 - report, don't abort
                 err[c["label"]] = f"{type(e).__name__}: {e}"[:300]
 

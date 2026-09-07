@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "ckh": {
+      "type": "stdio",
+      "command": "@CKH_PYTHON@",
+      "args": ["-m", "ckh.mcp"],
+      "cwd": "@CKH_REPO_ROOT@"
+    }
+  }
+}

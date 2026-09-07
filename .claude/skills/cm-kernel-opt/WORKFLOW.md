@@ -7,7 +7,16 @@ the boxes: most of the value is in *not* proceeding.
 
 ```
                      ┌──────────────────────────────────────────────┐
-   task ────────────►│  0  rig-warden                               │
+   task ────────────►│  P  pre-profiler        (target kernel known? │
+                     │     cl_intercept on the REAL pipeline   skip) │
+                     │     prefill vs generate · per-kernel share    │
+                     └──────────────────────┬───────────────────────┘
+                                            │
+            share too small ────────────────┴──► STOP: "Amdahl ceiling is N%"
+                                            │
+                                            ▼
+                     ┌──────────────────────────────────────────────┐
+                     │  0  rig-warden                               │
                      │     competing GPU work? env? noise floor?    │
                      └──────────────────────┬───────────────────────┘
                                             │
@@ -126,7 +135,10 @@ provisional: it drifts ~2x within a session.
 
 ```mermaid
 flowchart TD
-    T[task] --> W[0 rig-warden]
+    T[task] --> P[P pre-profiler: cl_intercept e2e]
+    P -->|kernel share too small| STOP2[STOP: Amdahl ceiling]
+    P --> W[0 rig-warden]
+    T -->|target kernel already fixed| W
     W -->|noise >= effect| STOP[STOP: not resolvable]
     W --> R[1 roofline-analyst]
     R -->|gap < 1.2x| A[2 algorithm-critic]

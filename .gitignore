@@ -2,3 +2,7 @@ platform.toml
 results/
 __pycache__/
 *.egg-info/
+.venv/
+.env
+.ckh_deploy.pass
+.vscode/mcp.json

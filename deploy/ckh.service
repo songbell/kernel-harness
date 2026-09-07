@@ -1,0 +1,21 @@
+# Template -- deploy_ckh.sh substitutes @INSTALL_DIR@ and @PORT@ per target host, so no
+# username or path is hardcoded here.
+[Unit]
+Description=CM kernel harness -- ckh MCP server (Streamable-HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_DIR@
+Environment=CKH_HTTP_HOST=0.0.0.0
+Environment=CKH_HTTP_PORT=@PORT@
+# MCP_AUTH_TOKEN is pushed by deploy_ckh.sh as a chmod-600 EnvironmentFile;
+# '-' = tolerate its absence (the server then runs unauthenticated and says so).
+EnvironmentFile=-@INSTALL_DIR@/ckh.env
+ExecStart=@INSTALL_DIR@/deploy/run_ckh.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -10,12 +10,30 @@ backend = "local"
 # Only needed if the CM frontend (libclangFEWrapper.so) is not already on the loader path.
 ld_library_path = ""
 
+# Every measurement ultimately calls `clops` to actually compile/run a CM kernel. Point this
+# at a checkout that provides it (e.g. your own aboutSHW's `opencl/` directory) if you have
+# one. Leave it empty to rely on a normally pip-installed `clops` instead -- it ships its own
+# setup.py, so `pip install -e /path/to/that/opencl` once, outside this file, is enough; you
+# do not need an aboutSHW checkout at all if you go that route. `ckh doctor` reports which of
+# the two is actually resolving and fails loudly if neither does.
+clops_path = ""
+
+# Interpreter the measurement subprocesses run under. Empty = bare "python" from PATH, which
+# is only right if you always launch ckh from a shell with the correct env activated. An
+# editor-launched MCP server or a systemd unit inherits a different PATH and silently picks
+# a different interpreter, so name the one that can import clops:
+#   python = "/home/you/miniforge3/envs/<env>/bin/python"
+python = ""
+
 [repos]
 # Kernel sources stay in their own repos; the harness never forks them.
 sandbox = "/path/to/aboutSHW"
 production = "/path/to/openvino"
 
-# Directory the sandbox tests import from (clops, test helpers).
+# Directories under `sandbox` that kernel specs import test helpers from. Not needed for
+# clops itself if exec.clops_path is set or clops is pip-installed -- this is for
+# kernel-spec-specific convenience imports (e.g. kernels/pa_small_q.py reusing
+# test_pa_small_q.py's input builders). A self-contained kernel spec needs none of this.
 sandbox_pythonpath = ["opencl", "opencl/tests/pageatten"]
 
 [rig]
@@ -26,3 +44,21 @@ noise_floor_pct = 2.0
 # Rounds per config. Configs are interleaved round-by-round and the MINIMUM is reported:
 # sequential A-then-B charges B for A's heat.
 rounds = 3
+
+[profile]
+# e2e profiling with cl_intercept (`ckh profile`). Where to look for, and install, cliloader.
+# If measurement happens inside a container, this MUST be a path the container can see --
+# an install the container cannot reach is the same as no install at all.
+install_prefix = "third_party"
+
+# Set only to pin a specific binary; normally leave empty and let the prefix search find it.
+cliloader = ""
+
+# The e2e pipeline to profile, as argv. Nothing here can be guessed -- a wrong guess costs a
+# full pipeline run -- so `ckh profile run` fails loudly rather than inventing one. Set it
+# here to make profiling unattended; leave it empty and pass the command after `--` instead.
+# pipeline = ["python", "benchmark.py", "-d", "GPU", "-m", "/models/foo", "-n", "3"]
+pipeline = []
+
+# Extra environment for that command only (driver knobs, PYTHONPATH for an out-of-tree build).
+# pipeline_env = { PYTHONPATH = "/opt/ov/python" }

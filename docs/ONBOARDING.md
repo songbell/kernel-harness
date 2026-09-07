@@ -3,8 +3,9 @@
 Written for an engineer picking up a CM kernel they did not write. Follow the order; the
 gates matter more than the steps, and most of the value is in *not* proceeding.
 
-Tool support is uneven — `doctor`, `bench` and `ledger` are implemented; `roofs`, `ablate`,
-`equiv` and `sweep` are still manual with reference scripts. Each step says which.
+Tool support is uneven — `doctor`, `bench`, `ledger`, `profile` and now `equiv` are
+implemented; `roofs`, `ablate` and `sweep` are still manual with reference scripts. Each step
+says which.
 
 ---
 
@@ -22,8 +23,40 @@ running in parallel once produced `ablation_off > ablation_on`, a physically imp
 ordering, and invalidated a whole batch of results.
 
 Optional, if you work with Claude Code: `.claude/skills/cm-kernel-opt/install.sh <workspace>`
-links the eight role definitions into your workspace. They also read fine as human
-checklists — each one names the specific failure it exists to prevent.
+links the role definitions into your workspace. They also read fine as human checklists —
+each one names the specific failure it exists to prevent.
+
+---
+
+## Step 0 — is this kernel worth optimizing at all? (implemented)
+
+Skip only if someone has already fixed the target kernel *and* justified the choice.
+
+```bash
+ckh profile setup --install                                    # find or bootstrap cliloader
+ckh profile run --out-dir results/profile --repeat 2 -- <your e2e pipeline command>
+ckh profile report --dump-dir results/profile --kernel <kernel>
+```
+
+This runs the **real pipeline** under cl_intercept, splits the device timeline into prefill
+and generate, and prints each kernel's share of its phase:
+
+```
+generate   3479.71 ms over   8532 calls  =  37.2% of the phase   -> Amdahl ceiling: 37.2%
+```
+
+That ceiling bounds any end-to-end win. A kernel 3x off its roofline that is 2% of the phase
+is not worth a week, and phase matters as much as name — the short-query rungs dominate
+*generate* and are nearly absent in *prefill*, so "attention is slow" means different things
+depending on whether you are looking at TTFT or TPS.
+
+Two results that are **not** performance results, and the report calls both out: zero matches
+for your kernel means it was never enqueued (check the feature flag and the build), and a
+concurrency factor above 1 means queues overlap, so the share bounds *device work* and the
+wall-clock win is smaller still.
+
+Collection is CLI-only on purpose — `profile run` executes an arbitrary command, so it is not
+exposed as an MCP tool.
 
 ---
 
@@ -153,25 +186,35 @@ wrong: SLM bandwidth, marshal ILP, barrier pipelining, and scalar loads in the r
 
 ---
 
-## Step 7 — per change: classify, prove, measure (partly manual)
+## Step 7 — per change: classify, prove, measure (implemented via `ckh equiv`)
 
 ```
-bitexact-classifier → implement → equivalence-prover → ckh bench → ckh ledger --add
+bitexact-classifier → implement → ckh equiv → ckh bench → ckh ledger --add
 ```
 
 **Classify first.** Bit-exact means every output bit identical, not "within tolerance". If
 bit-exact, no accuracy conversation is needed. If not, quantify the cost — the max_diff
 **distribution** over the correctness suite, not just the max — and get the owner's sign-off.
 
-**Then prove it**, don't argue it. An equivalence test must also be shown *capable of
-failing*. Three separate times a test reported success while proving nothing:
+**Then prove it**, don't argue it. `ckh equiv <kernel>` runs the kernel against its declared
+`KernelSpec.reference` (`TorchReference` — an independent Python/torch ground truth — or
+`KernelReference` — another compiled kernel as baseline) and requires a `non_vacuous` note on
+that reference: a documented reason the check is capable of failing, not just passing. Three
+separate times, before this existed, a hand-rolled equivalence test reported success while
+proving nothing:
 
 - the input never exercised the change (an all-ones mask masks nothing),
 - the two sides got different inputs,
 - the "does it fire?" probe was itself vacuous (the chosen mask was what the causal mask
   already applies).
 
-So print, alongside the pass, which inputs actually change the result. Reference:
+`ckh equiv` doesn't auto-detect any of these — it can't — but it forces the `non_vacuous`
+note to exist and warns loudly when it doesn't, and it shares input data between both sides
+by construction (the second failure mode above is no longer possible to get wrong). Worked
+examples: `kernels/pa_small_q.py` (TorchReference) and
+`kernels/pa_small_q_vs_baseline.py` (KernelReference) — both have a real, mutation-verified
+non_vacuous note; copy whichever shape fits, or ask the `kernel-onboarder` agent to do it.
+Older, pre-`ckh equiv` scripts are still useful for the axis-sweep patterns they used:
 `aboutSHW/opencl/tests/pageatten/harness/equiv_template.py`.
 
 **Record every outcome**, including rejections, with numbers:

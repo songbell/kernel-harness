@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ckh.reference import KernelReference, TorchReference
+
 
 @dataclass
 class Shape:
@@ -46,16 +48,31 @@ class KernelSpec:
     jit: Callable[[Shape], dict[str, Any]]
     # shape -> (gws, lws)
     dispatch: Callable[[Shape], tuple[list[int], list[int]]]
-    # shape -> list of kernel arguments, already in signature order. Buffers must come from
-    # `inputs` so that both sides of an A/B see identical data.
-    args: Callable[[Shape, dict], list[Any]]
-    # shape -> dict of host tensors. MUST be deterministic for a given shape: a generator that
-    # re-randomises per call once turned a bit-exact change into 0/96 spurious mismatches.
+    # shape, data, outputs -> list of kernel arguments, already in signature order. `data`
+    # comes from `inputs` (so both sides of an A/B see identical buffers -- a generator that
+    # re-randomises per call once turned a bit-exact change into 0/96 spurious mismatches),
+    # `outputs` from `outputs` (so the caller can read them back afterward instead of args()
+    # building throwaway tensors nothing can ever recover).
+    args: Callable[[Shape, dict, dict], list[Any]]
+    # shape -> dict of host tensors. MUST be deterministic for a given shape: see the `args`
+    # note above -- the same failure mode applies to input data as to output buffers.
     inputs: Callable[[Shape], dict]
-    # Buffers to read back and compare in an equivalence check, by name in the `inputs` dict.
+    # shape -> dict of freshly-built output-buffer tensors, keyed by name. Built once per
+    # measured call (bench: once per loop iteration, matching pre-refactor behavior; equiv:
+    # once, then read back). None means the kernel has nothing to read back (no `compare`,
+    # no `reference`).
+    outputs: Callable[[Shape], dict[str, Any]] | None = None
+    # Names (keys into `outputs`) to read back and diff in an equivalence check.
     compare: list[str] = field(default_factory=list)
+    # What "correct" means for this kernel. None means `ckh equiv` has nothing to check --
+    # `ckh bench`/`ckh round` (timing only) do not need this at all.
+    reference: TorchReference | KernelReference | None = None
 
     build_options: Callable[[Shape], str] | None = None
+    # Working directory for the measurement subprocess, relative to platform.sandbox. None
+    # falls back to Platform's historical default (opencl/tests/pageatten) -- override when a
+    # kernel/reference pair lives elsewhere.
+    cwd: str | None = None
     # Axes shown in table labels, in order.
     label_keys: list[str] = field(default_factory=list)
 

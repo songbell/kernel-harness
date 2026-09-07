@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "ckh": {
+      "type": "http",
+      "url": "@CKH_MCP_URL@"
+    }
+  }
+}

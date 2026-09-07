@@ -33,6 +33,14 @@ Two-repo workflow. The kernel is developed and measured in `aboutSHW`, then port
 
 Run in order. Each phase's output decides whether the next is worth doing.
 
+**P. `pre-profiler`** — *only when the target kernel is not already fixed by the user.* Run the
+real e2e pipeline under cl_intercept (`ckh profile setup|run|report`), split the timeline into
+prefill and generate, and report each kernel's share of its phase. That share is the **Amdahl
+ceiling** on any e2e win. → share too small : stop here, and say so.
+The pipeline command comes from `[profile].pipeline` in `platform.toml`, or you ask the user
+for it — in the main conversation, before dispatching any subagent, since a subagent cannot
+ask. Always pass `--no-prompt` so the CLI never blocks on stdin.
+
 **0. `rig-warden`** — check for competing GPU work, pick the environment, establish the noise
 floor. *Nothing below this line is trustworthy without it.*
 
