@@ -50,25 +50,49 @@ vacuous test:
 
 ```mermaid
 flowchart LR
-    P["ckh profile<br/>worth it at all?"] --> G["ckh kernelgen<br/><i>optional</i>"]
-    G --> KP["ckh kernel-profile<br/>where does it go?"]
-    KP --> ED["**edit the .cm**<br/>the only step that<br/>makes it faster"]
-    ED --> V["ckh validate<br/>no GPU time"]
-    V --> E["ckh equiv<br/>correct?"]
-    E --> B["ckh bench<br/>faster?"]
-    B -. next idea .-> ED
-    B --> T["ckh trial finalize<br/><i>optional</i>"]
-    T --> I["integrator<br/>→ plugin"]
-    P & V & E & B & T -. refuses .-> L(["STOP<br/>ckh ledger"])
-    style ED fill:#fff3cd,stroke:#856404,stroke-width:2px
+    SRC(["plugin .cm<br/>+ a shape"]) --> P
+    P["<b>Profile</b><br/>worth it at all?"] --> G["<b>Port</b><br/>plugin → sandbox<br/><i>optional</i>"]
+    G --> GEN["<b>Generate</b><br/>optimized kernel"]
+    GEN --> V["<b>Validate</b><br/>no GPU time"]
+    V --> E["<b>Verify</b><br/>vs reference"]
+    E --> B["<b>Benchmark</b><br/>interleaved min-of-N"]
+    B --> KP["<b>Kernel profile</b><br/>pipe-cycle budget"]
+    KP -.->|next candidate| GEN
+    B ==>|resolvable win| I(["<b>Integrate</b><br/>→ plugin, real model"])
+    P & V & E & B -.->|refuses| L(["STOP<br/>+ ledger"])
+
+    classDef analyze fill:#dbeafe,stroke:#3b82f6,stroke-width:2px
+    classDef gen     fill:#d1fae5,stroke:#10b981,stroke-width:3px
+    classDef valid   fill:#fef3c7,stroke:#f59e0b,stroke-width:2px
+    classDef bench   fill:#fed7aa,stroke:#ea580c,stroke-width:2px
+    classDef prof    fill:#e9d5ff,stroke:#a855f7,stroke-width:2px
+    classDef stop    fill:#fee2e2,stroke:#ef4444,stroke-width:2px
+    classDef io      fill:#f1f5f9,stroke:#64748b,stroke-width:2px
+    class P,G analyze
+    class GEN gen
+    class V,E valid
+    class B bench
+    class KP prof
+    class L stop
+    class SRC,I io
 ```
 
-**Only one box makes the kernel faster.** Everything else exists to stop you fooling yourself
-about whether it did — which is the whole reason this repo exists, since roughly half the
-effort in the pass it was distilled from went into wrong hypotheses and self-inflicted
-regressions. `kernel-profile` sits immediately before the edit because its job is to say
-*where* to edit; `validate` / `equiv` / `bench` sit immediately after because their job is to
-say whether the edit was worth keeping.
+| box | command | |
+|---|---|---|
+| Profile | `ckh profile` | e2e phase share — the Amdahl ceiling on any win |
+| Port | `ckh kernelgen` | *optional* — plugin `.cm` → sandbox, spec + compile test |
+| **Generate** | — | **the only box that makes it faster, and the only one with no `ckh` command behind it** |
+| Validate | `ckh validate` | jit · dispatch · constraints · compile. Never enqueues |
+| Verify | `ckh equiv` | vs `TorchReference` / `KernelReference` |
+| Benchmark | `ckh bench --verify` | device + wall, min-of-N, noise floor enforced |
+| Kernel profile | `ckh kernel-profile` | IGC dump → pipe-cycle hypotheses for the next candidate |
+| Integrate | `integrator` | sandbox → plugin; check output text **and** accepted-token count |
+
+The loop closes through **Kernel profile**, not through Benchmark: a timing number says a
+candidate was slower, not what to try next. Everything outside the green box exists to stop
+you fooling yourself about whether the green box helped — which is the whole reason this repo
+exists, since roughly half the effort in the pass it was distilled from went into wrong
+hypotheses and self-inflicted regressions.
 
 Each stage can refuse, and the refusal is the point — every one of them fired at least once in
 the pass this was distilled from:
@@ -85,9 +109,9 @@ the pass this was distilled from:
 at all. `validate` and `kernel-profile` are the exceptions — they compile but never enqueue,
 so they stay useful on a busy box.
 
-`trial finalize` is marked optional for the same reason `kernelgen` is: it only exists once
-you are keeping score across several candidates. A single edit measured with `ckh round`
-never needs it.
+`ckh trial` wraps the loop above when you are running several candidates: a budgeted tree, one
+source snapshot per node, and a `finalize` that re-measures the shortlist against the baseline
+in one interleaved batch. A single candidate measured with `ckh round` never needs it.
 
 The **knowledge base** (`kb/`) carries the expertise the loop consults: correctness
 constraints, memory-access and fusion patterns, XPU/Xe-specific tuning, and harness-design
