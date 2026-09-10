@@ -5,5 +5,4 @@ __pycache__/
 .venv/
 .env
 .ckh_deploy.pass
-.vscode/mcp.json
 trials/

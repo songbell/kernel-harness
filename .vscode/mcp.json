@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "ckh": {
+      "type": "stdio",
+      "command": "ckh-mcp",
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

@@ -7,6 +7,8 @@ Kernels stay in their own repos; this repo holds the **method**, the **tooling**
 → **Optimizing a kernel?** — [Quickstart](#quickstart) gets you measuring in a few minutes.
 → **Onboarding a kernel you did not write?** — [`docs/ONBOARDING.md`](docs/ONBOARDING.md) is
 the step-by-step path, including which steps have tool support today and which are manual.
+→ **Connecting GitHub Copilot?** — [`kernel-harness-mcp-setup`](.github/skills/kernel-harness-mcp-setup/SKILL.md)
+explains the local `ckh` MCP setup and the interpreter/path checks that prevent common failures.
 
 ## How it Works
 
@@ -140,6 +142,17 @@ ckh bench pa_small_q --axis q_len=6,16   # interleaved min-of-N over a shape gri
 ckh bench pa_small_q --verify            # ... with the reference check gating the timings
 ckh equiv pa_small_q --axis q_len=6      # check the kernel against its declared reference
 ```
+
+## Use with GitHub Copilot
+
+After `pip install -e .`, open the repository in VS Code. The tracked
+`.vscode/mcp.json` starts the local `ckh-mcp` server from the active Python environment; approve
+the MCP trust prompt, then reload the window if the server is not started automatically. Select
+**CKH Kernel Harness** from the Chat agent picker to use the guarded measurement workflow.
+
+If the `ckh` tools do not appear, ensure `ckh-mcp` is available in the environment VS Code uses,
+then run **MCP: List Servers** and start or enable `ckh`. See
+[`kernel-harness-mcp-setup`](.github/skills/kernel-harness-mcp-setup/SKILL.md) for diagnostics.
 
 ## Before optimizing anything: `ckh profile`
 
