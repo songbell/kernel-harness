@@ -145,13 +145,14 @@ ckh equiv pa_small_q --axis q_len=6      # check the kernel against its declared
 
 ## Use with GitHub Copilot
 
-After `pip install -e .`, open the repository in VS Code. The tracked
-`.vscode/mcp.json` starts the local `ckh-mcp` server from the active Python environment; approve
-the MCP trust prompt, then reload the window if the server is not started automatically. Select
-**CKH Kernel Harness** from the Chat agent picker to use the guarded measurement workflow.
+After `pip install -e .`, open the repository root in VS Code. The tracked `.mcp.json` and
+`.vscode/mcp.json` start the local `ckh` MCP server through `deploy/ckh-mcp-vscode`, which avoids
+depending on the editor process inheriting the same `PATH` as an interactive shell. Approve the MCP
+trust prompt, then reload the window if the server is not started automatically. Select **CKH Kernel
+Harness** from the Chat agent picker to use the guarded measurement workflow.
 
-If the `ckh` tools do not appear, ensure `ckh-mcp` is available in the environment VS Code uses,
-then run **MCP: List Servers** and start or enable `ckh`. See
+If the `ckh` tools do not appear, confirm the VS Code workspace folder is this repository root, then
+run **MCP: List Servers** and start or enable `ckh`. See
 [`kernel-harness-mcp-setup`](.github/skills/kernel-harness-mcp-setup/SKILL.md) for diagnostics.
 
 ## Before optimizing anything: `ckh profile`
