@@ -364,6 +364,32 @@ def cmd_profile(a) -> int:
         return 1
     shares = []
     for t in traces:
+        if a.dflash:
+            cfg_dflash = cfg.get("dflash", {})
+            main_config = a.dflash_main_config or cfg_dflash.get("main_config")
+            draft_config = a.dflash_draft_config or cfg_dflash.get("draft_config")
+            if not main_config or not draft_config:
+                print("dflash requires --dflash-main-config and --dflash-draft-config, "
+                      "or [profile.dflash] config paths in platform.toml")
+                return 1
+            try:
+                spec = cli_layer.DFlashPatternSpec(
+                    main_layers=cli_layer.load_num_hidden_layers(Path(main_config)),
+                    draft_layers=cli_layer.load_num_hidden_layers(Path(draft_config)),
+                    main_full_attention_layers=cli_layer.load_full_attention_layers(
+                        Path(main_config)),
+                    cm_regex=cfg_dflash.get("cm_regex", r"cm_sdpa_vlen"),
+                    main_regex=cfg_dflash.get(
+                        "main_regex", r"sdpa_micro__generate|paged_attention_opt"),
+                    draft_regex=cfg_dflash.get("draft_regex", r"sdpa_micro__prefill"),
+                    gap_ms=float(cfg_dflash.get("gap_ms", 50.0)))
+                res = cli_layer.analyze_dflash(t, spec)
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                print(f"dflash config error: {e}")
+                return 1
+            print(cli_layer.render_dflash(res))
+            print()
+            continue
         res = cli_layer.analyze(t, a.kernel, seg)
         print(cli_layer.render(res, a.top))
         print()
@@ -682,10 +708,15 @@ def main() -> int:
     prep = pact.add_parser("report", help="per-phase kernel budget + Amdahl ceiling")
     prep.add_argument("--dump-dir", required=True)
     prep.add_argument("--kernel", default="", help="regex for the kernel under investigation")
-    prep.add_argument("--top", type=int, default=15)
+    prep.add_argument("--top", type=int, default=5,
+                      help="global kernels to show (default 5)")
     prep.add_argument("--anchor", default="", help="regex marking the generate phase")
     prep.add_argument("--gap-ms", type=float, default=50.0)
     prep.add_argument("--drop-cycles", type=int, default=1)
+    prep.add_argument("--dflash", action="store_true",
+                      help="report dflash pattern groups instead of phase/top-kernel output")
+    prep.add_argument("--dflash-main-config")
+    prep.add_argument("--dflash-draft-config")
 
     for p in (ps, prun, prep):
         p.add_argument("--cli", help="path to cliloader")

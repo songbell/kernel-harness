@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 # ckh.reference imports numpy unconditionally, so it is a runtime dependency, not a dev one.
 # torch is deliberately NOT here: only TorchReference needs it, and the measurement box
 # usually already has a specific build of it that pip must not fight over.
-dependencies = ["numpy"]
+dependencies = ["numpy", "pybind11"]
 
 [project.scripts]
 ckh = "ckh.cli:main"

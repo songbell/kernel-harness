@@ -37,6 +37,41 @@ class Refused(RuntimeError):
     """Raised when proceeding would produce a number that cannot be trusted."""
 
 
+@dataclass(frozen=True)
+class DFlashPatternSpec:
+    """The three attention groups emitted by one dflash iteration."""
+    main_layers: int
+    draft_layers: int
+    main_full_attention_layers: int | None = None
+    cm_regex: str = r"cm_sdpa_vlen"
+    main_regex: str = r"sdpa_micro__generate|paged_attention_opt"
+    draft_regex: str = r"sdpa_micro__prefill"
+    gap_ms: float = 50.0
+
+
+def load_num_hidden_layers(config: Path) -> int:
+    """Read layer count from a HF/OpenVINO config, including nested text_config."""
+    data = json.loads(config.read_text())
+    for obj in (data, data.get("text_config", {}), data.get("dflash_config", {})):
+        value = obj.get("num_hidden_layers")
+        if isinstance(value, int) and value > 0:
+            return value
+    raise ValueError(f"{config}: no positive num_hidden_layers")
+
+
+def load_full_attention_layers(config: Path) -> int:
+    """Count full-attention layers; linear-attention models expose layer_types."""
+    data = json.loads(config.read_text())
+    candidates = [data, data.get("text_config", {})]
+    for obj in candidates:
+        layer_types = obj.get("layer_types")
+        if isinstance(layer_types, list):
+            count = sum(value == "full_attention" for value in layer_types)
+            if count:
+                return count
+    return load_num_hidden_layers(config)
+
+
 # -- locate / install ------------------------------------------------------------------
 
 def locate(prefix: str | Path | None = None, explicit: str | None = None) -> Path | None:
@@ -217,11 +252,70 @@ def _span_ms(evs) -> float:
     return (max(ts + d for ts, d, _ in evs) - min(ts for ts, _, _ in evs)) / 1000.0
 
 
+def analyze_dflash(trace: Path, spec: DFlashPatternSpec) -> dict:
+    """Find dflash iterations as cm_sdpa_vlen + main attention + draft attention.
+
+    The trace does not carry model ownership, so classification is deliberately regex- and
+    count-based. A result is marked incomplete instead of silently assigning events to the
+    wrong model when a layer sequence is truncated or interleaved.
+    """
+    raw = _absolute(_load_events(trace))
+    if not raw:
+        return {"trace": str(trace), "patterns": [], "warnings": ["no device events"]}
+    cm_re = re.compile(spec.cm_regex, re.I)
+    main_re = re.compile(spec.main_regex, re.I)
+    draft_re = re.compile(spec.draft_regex, re.I)
+    attention = [(ts, dur, name) for ts, dur, name in raw
+                 if cm_re.search(name) or main_re.search(name) or draft_re.search(name)]
+    anchors = [event for event in attention if cm_re.search(event[2])]
+    patterns = []
+    if anchors:
+        main = [event for event in attention if main_re.search(event[2])]
+        draft = [event for event in attention if draft_re.search(event[2])]
+        main_layers = spec.main_full_attention_layers or spec.main_layers
+        patterns.append({
+            "index": 1,
+            "cm_sdpa_vlen": len(anchors),
+            "main_attention": len(main),
+            "draft_attention": len(draft),
+            "main_sequences": len(main) / main_layers,
+            "draft_sequences": len(draft) / spec.draft_layers,
+            "complete": (len(main) % main_layers == 0 and
+                         len(draft) % spec.draft_layers == 0),
+            "start_us": anchors[0][0],
+            "end_us": attention[-1][0] + attention[-1][1],
+        })
+    warnings = []
+    if not anchors:
+        warnings.append(f"no dflash anchor matches /{spec.cm_regex}/")
+    if any(not pattern["complete"] for pattern in patterns):
+        warnings.append("one or more dflash patterns have incomplete layer sequences")
+    return {"trace": str(trace),
+            "main_layers": spec.main_full_attention_layers or spec.main_layers,
+            "draft_layers": spec.draft_layers, "patterns": patterns, "warnings": warnings}
+
+
+def render_dflash(result: dict) -> str:
+    lines = [f"trace   {result['trace']}",
+             f"dflash  main_layers={result.get('main_layers', '?')} "
+             f"draft_layers={result.get('draft_layers', '?')}",
+             "pattern cm_sdpa_vlen main_attention draft_attention main_seq draft_seq status"]
+    for pattern in result.get("patterns", []):
+        status = "complete" if pattern["complete"] else "INCOMPLETE"
+        lines.append(f"{pattern['index']:>7} {pattern['cm_sdpa_vlen']:>13} "
+                     f"{pattern['main_attention']:>15} {pattern['draft_attention']:>15} "
+                     f"{pattern['main_sequences']:>9.2f} {pattern['draft_sequences']:>10.2f} "
+                     f"{status}")
+    for warning in result.get("warnings", []):
+        lines.append(f"WARNING: {warning}")
+    return "\n".join(lines)
+
+
 @dataclass
 class Segmentation:
     """The prefill/generate split is a decision, not a fact. These are its knobs, and the
     report states which values produced it."""
-    split_kernel: str = r"small_q|_tq\d|single_token"
+    split_kernel: str = ""
     pa_regex: str = r"pa_|sdpa|paged_attention"
     gap_ms: float = 50.0
     drop_cycles: int = 1
@@ -243,7 +337,7 @@ def analyze(trace: Path, kernel: str = "", seg: Segmentation | None = None) -> d
     prologue = [e for e in evs if first_pa is not None and e[0] < first_pa]
     body = [e for e in evs if first_pa is None or e[0] >= first_pa]
 
-    windows = _generate_windows(body, split_re, seg.gap_ms * 1000.0)
+    windows = _generate_windows(body, split_re, seg.gap_ms * 1000.0) if seg.split_kernel else []
     if seg.drop_cycles and len(windows) > seg.drop_cycles:
         cut = windows[seg.drop_cycles - 1][1]
         body = [e for e in body if e[0] >= cut]
@@ -255,6 +349,7 @@ def analyze(trace: Path, kernel: str = "", seg: Segmentation | None = None) -> d
     out = {
         "trace": str(trace),
         "app_metrics": _read_metrics(trace.parent / "app_metrics.txt"),
+        "global": {"rows": _summarize(evs), "span_ms": _span_ms(evs)},
         "segmentation": {"anchor": seg.split_kernel, "gap_ms": seg.gap_ms,
                          "cycles": len(windows), "dropped_cycles": seg.drop_cycles,
                          "prologue_events": len(prologue),
@@ -337,10 +432,23 @@ def render(result: dict, top: int = 15) -> str:
     for k, v in result["app_metrics"].items():
         L.append(f"app     {k}={v}")
     s = result["segmentation"]
-    L.append(f"split   anchor /{s['anchor']}/  gap>{s['gap_ms']}ms  "
+    anchor = f"/{s['anchor']}/" if s["anchor"] else "(none; global summary)"
+    L.append(f"split   anchor {anchor}  gap>{s['gap_ms']}ms  "
              f"cycles={s['cycles']} (dropped {s['dropped_cycles']})")
     L.append(f"dropped {s['prologue_events']} prologue events ({s['prologue_ms']:.1f} ms), "
              f"{s['mem_ops']} clEnqueue* mem ops ({s['mem_ms']:.1f} ms, excluded)")
+
+    global_phase = result["global"]
+    global_rows = global_phase["rows"]
+    global_total = sum(r["total_ms"] for r in global_rows)
+    L.append(f"\nGLOBAL TOP KERNELS  summed device {global_total:.1f} ms"
+             f" over a {global_phase['span_ms']:.1f} ms wall span")
+    L.append(f"  {'kernel':<48}{'calls':>8}{'total_ms':>11}{'%total':>8}"
+             f"{'mean_us':>10}{'p50':>9}{'p90':>9}")
+    for r in global_rows[:top]:
+        pct = 100.0 * r["total_ms"] / global_total if global_total else 0.0
+        L.append(f"  {r['kernel'][:48]:<48}{r['calls']:>8}{r['total_ms']:>11.2f}"
+                 f"{pct:>7.1f}%{r['mean_us']:>10.2f}{r['p50_us']:>9.2f}{r['p90_us']:>9.2f}")
 
     for name in ("prefill", "generate"):
         ph = result["phases"][name]

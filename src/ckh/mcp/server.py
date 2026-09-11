@@ -277,7 +277,7 @@ def _profile_status(args: dict[str, Any]) -> Any:
 
 @server.tool(
     "profile_report",
-    "Per-phase, per-kernel time budget from an existing cl_intercept dump, plus the Amdahl "
+    "Global top-kernel time summary from an existing cl_intercept dump, plus the Amdahl "
     "ceiling: the share of the phase a kernel occupies bounds any e2e win from optimizing "
     "it. Run this BEFORE choosing a kernel -- a kernel 3x off its roofline that is 2% of the "
     "phase is not worth optimizing.",
@@ -286,12 +286,15 @@ def _profile_status(args: dict[str, Any]) -> Any:
         "properties": {
             "dump_dir": {"type": "string", "description": "directory produced by `ckh profile run`"},
             "kernel": {"type": "string", "description": "regex for the kernel under investigation"},
-            "top": {"type": "integer", "description": "rows per phase (default 15)"},
+            "top": {"type": "integer", "description": "global kernel rows (default 5)"},
             "anchor": {"type": "string",
                        "description": "regex marking the generate phase; the prefill/generate "
                                       "split is a decision and this is its knob"},
             "gap_ms": {"type": "number", "description": "silence that separates two cycles"},
             "drop_cycles": {"type": "integer", "description": "warm-up iterations to discard"},
+            "dflash": {"type": "boolean", "description": "report the configured dflash pattern"},
+            "dflash_main_config": {"type": "string"},
+            "dflash_draft_config": {"type": "string"},
         },
         "required": ["dump_dir"],
     },
@@ -307,8 +310,27 @@ def _profile_report(args: dict[str, Any]) -> Any:
         seg.split_kernel = args["anchor"]
     out = []
     for t in traces:
+        if args.get("dflash"):
+            cfg = Platform.load().raw.get("profile", {}).get("dflash", {})
+            main_config = args.get("dflash_main_config") or cfg.get("main_config")
+            draft_config = args.get("dflash_draft_config") or cfg.get("draft_config")
+            if not main_config or not draft_config:
+                raise ValueError("dflash requires profile.dflash main_config and draft_config")
+            spec = clintercept.DFlashPatternSpec(
+                main_layers=clintercept.load_num_hidden_layers(Path(main_config)),
+                draft_layers=clintercept.load_num_hidden_layers(Path(draft_config)),
+                main_full_attention_layers=clintercept.load_full_attention_layers(
+                    Path(main_config)),
+                cm_regex=cfg.get("cm_regex", r"cm_sdpa_vlen"),
+                main_regex=cfg.get("main_regex", r"sdpa_micro__generate|paged_attention_opt"),
+                draft_regex=cfg.get("draft_regex", r"sdpa_micro__prefill"),
+                gap_ms=float(cfg.get("gap_ms", 50.0)))
+            res = clintercept.analyze_dflash(t, spec)
+            out.append({"table": clintercept.render_dflash(res),
+                        "patterns": res["patterns"], "warnings": res["warnings"]})
+            continue
         res = clintercept.analyze(t, args.get("kernel", ""), seg)
-        out.append({"table": clintercept.render(res, int(args.get("top", 15))),
+        out.append({"table": clintercept.render(res, int(args.get("top", 5))),
                     "kernel": res.get("kernel"), "warnings": res["warnings"]})
     return out
 

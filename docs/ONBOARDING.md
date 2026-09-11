@@ -15,8 +15,15 @@ says which.
 git clone <this repo> && cd cm-kernel-harness
 cp platform.example.toml platform.toml && $EDITOR platform.toml   # your kernel repo paths
 pip install -e .
+pip install -e /path/to/aboutSHW/opencl                         # the clops binding used by measurements
 ckh doctor
 ```
+
+The second install is required when `exec.clops_path` is empty. It installs the `clops`
+package from the sandbox checkout named by `repos.sandbox`; `pybind11` is installed by the
+harness itself because clops imports it during measurement setup. If `exec.clops_path` points
+at a checkout that already provides clops, keep the harness install and skip the editable
+clops install.
 
 `ckh doctor` must print `competing work none`. If it lists anything, stop — a benchmark
 running in parallel once produced `ablation_off > ablation_on`, a physically impossible

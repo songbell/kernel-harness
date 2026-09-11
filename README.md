@@ -131,6 +131,7 @@ so a rejected idea is never re-tried blind.
 cp platform.example.toml platform.toml   # the only machine-specific file
 $EDITOR platform.toml                    # point it at your kernel repos
 pip install -e .
+pip install -e /path/to/aboutSHW/opencl        # required when exec.clops_path is empty
 
 ckh doctor                               # validate env, check clops resolves, check for competing GPU work
 ckh ledger pa_small_q --only rejected    # READ THIS FIRST -- what is already settled
