@@ -1,6 +1,21 @@
+import os
 from pathlib import Path
 
 from ckh import clintercept
+
+
+def test_locate_finds_windows_cliloader(tmp_path, monkeypatch):
+    monkeypatch.setattr(clintercept.os, "name", "nt")
+    linux_loader = tmp_path / "clintercept-3.0.6-Linux" / "bin" / "cliloader"
+    linux_loader.parent.mkdir(parents=True)
+    linux_loader.write_text("")
+    os.chmod(linux_loader, 0o755)
+    loader = tmp_path / "clintercept-3.0.6-win64" / "Release" / "cliloader.exe"
+    loader.parent.mkdir(parents=True)
+    loader.write_text("")
+    os.chmod(loader, 0o755)
+
+    assert clintercept.locate(tmp_path) == loader
 
 
 def _trace(tmp_path: Path) -> Path:

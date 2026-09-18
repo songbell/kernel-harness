@@ -16,13 +16,13 @@ import subprocess
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_VERSION = "3.0.6"
-RELEASE_URL = ("https://github.com/intel/opencl-intercept-layer/releases/download/"
-               "v{v}/clintercept-{v}-Linux.tar.gz")
+RELEASE_URL = "https://github.com/intel/opencl-intercept-layer/releases/download/v{v}/clintercept-{v}-{platform}.{extension}"
 
 # -cdt is the per-queue device timeline (the JSON carrying per-kernel dur) and is required.
 # -dv is the aggregate report, a cheap cross-check on it.
@@ -74,6 +74,12 @@ def load_full_attention_layers(config: Path) -> int:
 
 # -- locate / install ------------------------------------------------------------------
 
+def _release_info() -> tuple[str, str]:
+    if os.name == "nt":
+        return "win64", "zip"
+    return "Linux", "tar.gz"
+
+
 def locate(prefix: str | Path | None = None, explicit: str | None = None) -> Path | None:
     if explicit and os.access(explicit, os.X_OK):
         return Path(explicit)
@@ -82,8 +88,15 @@ def locate(prefix: str | Path | None = None, explicit: str | None = None) -> Pat
         return Path(env)
     roots = [Path(prefix)] if prefix else []
     for root in roots:
-        for c in sorted(root.glob("clintercept-*/bin/cliloader")) + \
-                 sorted(root.glob("clintercept-src/bin/cliloader")):
+        if os.name == "nt":
+            candidates = sorted(root.glob("clintercept-*/bin/cliloader.exe")) + \
+                         sorted(root.glob("clintercept-*/cliloader.exe")) + \
+                         sorted(root.glob("clintercept-*/Release/cliloader.exe")) + \
+                         sorted(root.glob("clintercept-src/**/cliloader.exe"))
+        else:
+            candidates = sorted(root.glob("clintercept-*/bin/cliloader")) + \
+                         sorted(root.glob("clintercept-src/bin/cliloader"))
+        for c in candidates:
             if os.access(c, os.X_OK):
                 return c
     which = shutil.which("cliloader")
@@ -108,14 +121,19 @@ def install(prefix: str | Path, version: str = DEFAULT_VERSION,
         subprocess.run(["cmake", "--build", str(src / "build"),
                         "-j", str(os.cpu_count() or 4), "--target", "install"], check=True)
     else:
-        url = RELEASE_URL.format(v=version)
-        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        release_platform, extension = _release_info()
+        url = RELEASE_URL.format(v=version, platform=release_platform, extension=extension)
+        with tempfile.NamedTemporaryFile(suffix=f".{extension}", delete=False) as tmp:
             with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 (fixed https URL)
                 shutil.copyfileobj(resp, tmp)
             tarball = tmp.name
         try:
-            with tarfile.open(tarball) as tf:
-                tf.extractall(prefix, filter="data")
+            if extension == "zip":
+                with zipfile.ZipFile(tarball) as zf:
+                    zf.extractall(prefix)
+            else:
+                with tarfile.open(tarball) as tf:
+                    tf.extractall(prefix, filter="data")
         finally:
             os.unlink(tarball)
     cli = locate(prefix)
