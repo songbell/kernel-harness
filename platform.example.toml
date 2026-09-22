@@ -10,18 +10,10 @@ backend = "local"
 # Only needed if the CM frontend (libclangFEWrapper.so) is not already on the loader path.
 ld_library_path = ""
 
-# Every measurement ultimately calls `clops` to actually compile/run a CM kernel. Point this
-# at a checkout that provides it (e.g. your own aboutSHW's `opencl/` directory) if you have
-# one. Leave it empty to rely on a normally pip-installed `clops` instead -- it ships its own
-# setup.py, so `pip install -e /path/to/that/opencl` once, outside this file, is enough; you
-# do not need an aboutSHW checkout at all if you go that route. `ckh doctor` reports which of
-# the two is actually resolving and fails loudly if neither does.
-clops_path = ""
-
 # Interpreter the measurement subprocesses run under. Empty = bare "python" from PATH, which
 # is only right if you always launch ckh from a shell with the correct env activated. An
 # editor-launched MCP server or a systemd unit inherits a different PATH and silently picks
-# a different interpreter, so name the one that can import clops:
+# a different interpreter, so set this explicitly when needed:
 #   python = "/home/you/miniforge3/envs/<env>/bin/python"
 python = ""
 
@@ -30,8 +22,7 @@ python = ""
 sandbox = "/path/to/aboutSHW"
 production = "/path/to/openvino"
 
-# Directories under `sandbox` that kernel specs import test helpers from. Not needed for
-# clops itself if exec.clops_path is set or clops is pip-installed -- this is for
+# Directories under `sandbox` that kernel specs import test helpers from. These are for
 # kernel-spec-specific convenience imports (e.g. kernels/pa_small_q.py reusing
 # test_pa_small_q.py's input builders). A self-contained kernel spec needs none of this.
 sandbox_pythonpath = ["opencl", "opencl/tests/pageatten"]
@@ -51,6 +42,21 @@ rounds = 3
 # an install the container cannot reach is the same as no install at all.
 install_prefix = "third_party"
 
+# Optional path/string lookup for callers that dynamically construct commands. This does NOT
+# select GitHub Copilot models; Copilot model routing lives in `.github/agents/*.agent.md`.
+# [profile.models]
+# router = "/models/router"
+# reasoner = "/models/reasoner"
+# [profile.stage_models]
+# profile = "router"
+# kernelgen = "reasoner"
+# validate = "reasoner"
+# kernel-profile = "reasoner"
+# bench = "reasoner"
+# equiv = "reasoner"
+# round = "reasoner"
+# snapshot = "reasoner"
+
 # Set only to pin a specific binary; normally leave empty and let the prefix search find it.
 cliloader = ""
 
@@ -59,6 +65,15 @@ cliloader = ""
 # here to make profiling unattended; leave it empty and pass the command after `--` instead.
 # pipeline = ["python", "benchmark.py", "-d", "GPU", "-m", "/models/foo", "-n", "3"]
 pipeline = []
+
+# Optional stage-aware model routing for callers that build a pipeline command dynamically.
+# `ckh profile model <stage>` prints the selected path and fails on unknown names.
+# [profile.models]
+# router = "/models/router"
+# reasoner = "/models/reasoner"
+# [profile.stage_models]
+# draft = "router"
+# verify = "reasoner"
 
 # Extra environment for that command only (driver knobs, PYTHONPATH for an out-of-tree build).
 # pipeline_env = { PYTHONPATH = "/opt/ov/python" }

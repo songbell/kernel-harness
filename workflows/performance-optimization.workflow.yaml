@@ -1,0 +1,90 @@
+workflow:
+  id: cm-kernel-performance-optimization
+  version: 1.0.0
+  description: "Profile a real pipeline, localize the hot kernel, optimize it under CKH gates, and verify the result end to end."
+  execution:
+    mode: sequential
+    max_active_steps: 1
+    rule: "Start a step only after the previous step returns and its gate passes; never dispatch adjacent workflow steps concurrently."
+
+role_bindings:
+  gatekeeper: ckh-doctor
+  preflight: ckh-pre-profiler
+  collector: ckh-profile-runner
+  reporter: ckh-profile-reporter
+  onboarder: ckh-kernel-onboarder
+  roofline: ckh-roofline-analyst
+  critic: ckh-algorithm-critic
+  budgeter: ckh-budget-prober
+  classifier: ckh-bitexact-classifier
+  optimizer: ckh-kernel-optimizer
+  prover: ckh-equivalence-prover
+  benchmarker: ckh-benchmarker
+  tuner: ckh-range-tuner
+  integrator: ckh-integrator
+
+service_bindings:
+  knowledge_base:
+    implementation: ckh-ledger
+    invocation_points:
+      - step: reporter
+        mode: read
+        timing: after_step
+        purpose: "Surface prior measurements or rejections as context; this never bypasses kernel generation."
+      - step: budgeter
+        mode: read
+        timing: before_step
+        purpose: "Reuse prior probe findings before proposing a new ablation."
+      - step: integrator
+        mode: write
+        timing: after_step
+        purpose: "Record the adopted or rejected end-to-end result in the ledger and kernel comments."
+  skill_library:
+    implementation: local-markdown
+    subscription: on_demand
+
+graph:
+  - step: gatekeeper
+  - step: preflight
+    condition: "target_kernel_unknown == true"
+  - step: collector
+    condition: "target_kernel_unknown == true"
+  - step: reporter
+    condition: "target_kernel_unknown == true"
+    requires:
+      - "collector.output.dump_dir"
+      - "collector.output.runs"
+      - "collector.output.ok == true"
+  - gate: kernel_selection
+    owner: coordinator
+    condition: "target_kernel_unknown == true"
+    interaction: user_choice
+    requires:
+      - "reporter.output.top_kernels"
+      - "reporter.output.dump_sources"
+    outputs:
+      - selected_kernel
+      - selected_kernel_share
+  - step: onboarder
+    requires:
+      - "kernel_selection.output.selected_kernel"
+      - "reporter.output.dump_sources"
+  - step: roofline
+  - step: critic
+    condition: "roofline.output.requires_algorithm_review == true"
+  - step: budgeter
+  - loop:
+      steps:
+        - classifier
+        - optimizer
+        - prover
+        - benchmarker
+      continue_condition: "benchmarker.output.adopted != true"
+      max_iterations: 3
+  - step: tuner
+    condition: "optimizer.output.changed_numeric_constant == true"
+  - step: integrator
+
+finalizers:
+  - trigger: on_run_end
+    action: "report the last measured blocker or the adopted end-to-end result"

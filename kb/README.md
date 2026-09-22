@@ -1,7 +1,7 @@
 # CM kernel knowledge base
 
 Split by concern, not one big file. Consulted during Phase 1 analysis (see
-`.claude/agents/algorithm-critic.md`) alongside the measured roofs in `microbench/`.
+`.github/agents/ckh-algorithm-critic.agent.md`) alongside the measured roofs in `microbench/`.
 
 | File | Concern |
 |---|---|

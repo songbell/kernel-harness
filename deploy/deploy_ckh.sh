@@ -73,6 +73,7 @@ fi
 
 # --------------------------------------------------------------- remote lane ----------
 echo "== remote lane: ship the harness to the GPU box and serve it over HTTP =="
+echo "== NOTE: remote lane is under development; validate the target environment carefully =="
 
 [[ -n "$REMOTE_HOST" ]] || { echo "ERROR: set CKH_REMOTE_HOST in .env (the box with the GPU)"; exit 1; }
 [[ -n "$REMOTE_USER" ]] || { echo "ERROR: set CKH_REMOTE_USER in .env (your ssh user / IDSID)"; exit 1; }

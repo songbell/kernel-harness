@@ -11,6 +11,7 @@ Run:  python3 -m ckh.mcp            (stdio, local)
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,12 +24,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from ckh import bench, clintercept, equiv, ledger, results   # noqa: E402
+from ckh import bench, clintercept, equiv, kernelgen, ledger, results   # noqa: E402
 from ckh.platform import Platform                      # noqa: E402
 
 server = McpServer("ckh", "0.1.0")
 
 _KERNEL_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_PROFILE_RUN_ALLOWED = True
 
 
 def _spec(name: str):
@@ -67,13 +69,12 @@ def _guarded_platform() -> Platform:
 
 @server.tool(
     "doctor",
-    "Validate the measurement environment BEFORE trusting any number: config paths, whether "
-    "`clops` resolves, and whether competing GPU work is running. Call this first in a session.",
+    "Validate the measurement environment BEFORE trusting any number: config paths and "
+    "whether competing GPU work is running. Call this first in a session.",
     {"type": "object", "properties": {}},
 )
 def _doctor(_args: dict[str, Any]) -> Any:
     plat = Platform.load()
-    clops_ok, clops_msg = plat.check_clops()
     busy = plat.competing_gpu_work()
     return {
         "backend": plat.backend,
@@ -81,9 +82,8 @@ def _doctor(_args: dict[str, Any]) -> Any:
         "production": {"path": str(plat.production), "exists": plat.production.exists()},
         "noise_floor_pct": plat.noise_floor_pct,
         "rounds": plat.rounds,
-        "clops": {"ok": clops_ok, "detail": clops_msg},
         "competing_gpu_work": busy,
-        "ready": bool(clops_ok and not busy),
+        "ready": not busy,
     }
 
 
@@ -105,6 +105,144 @@ def _list_kernels(_args: dict[str, Any]) -> Any:
         except Exception as exc:
             out.append({"kernel": p.stem, "error": str(exc)})
     return out
+
+
+def _resolve_port_source(plat: Platform, kernel: str, source: str | None,
+                         dump_sources: str | None = None,
+                         profile_dump_dir: str | None = None) -> Path:
+    if source:
+        src_path = Path(source)
+        if not src_path.exists():
+            raise ValueError(f"{src_path} not found")
+        return src_path
+
+    dump_root = None
+    if profile_dump_dir:
+        dump_root = kernelgen.dump_sources_from_profile_dir(Path(profile_dump_dir))
+    if dump_root is None:
+        last_profile = results.last_profile()
+        if last_profile and last_profile.get("out_dir"):
+            dump_root = kernelgen.dump_sources_from_profile_dir(Path(last_profile["out_dir"]))
+    if dump_root is None:
+        dump_root = kernelgen.configured_dump_sources(plat.raw, dump_sources)
+    if dump_root:
+        hits = kernelgen.dump_candidates(dump_root, kernel)
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"'{kernel}' matches {len(hits)} dumped sources under {dump_root}; pass source to disambiguate: "
+                + ", ".join(p.name for p in hits)
+            )
+
+    hits = kernelgen.candidates(plat.production, kernel)
+    if not hits:
+        raise ValueError(
+            f"no kernel source under the known plugin trees matches '{kernel}'. Pass source if you already know it"
+        )
+    if len(hits) > 1:
+        raise ValueError(
+            f"'{kernel}' matches {len(hits)} kernels; pass source to disambiguate: "
+            + ", ".join(p.name for p in hits)
+        )
+    return hits[0]
+
+
+@server.tool(
+    "kernel_prepare",
+    "After profile_report names a hot kernel and the user picks one, port the plugin kernel source into "
+    "the aboutSHW sandbox and emit the onboarding bundle: wrapper, compile test, correctness "
+    "scaffold, perf scaffold, and a harness spec. Refuses to invent inputs or dispatch.",
+    {
+        "type": "object",
+        "properties": {
+            "kernel": {"type": "string", "description": "profiled kernel name, e.g. sdpa_micro__generate"},
+            "source": {"type": "string", "description": "optional explicit kernel-source path to port"},
+            "dump_sources": {"type": "string", "description": "optional OV_GPU_DUMP_SOURCES_PATH directory to search first"},
+            "profile_dump_dir": {"type": "string", "description": "optional profile out_dir whose profile_run.json names the dumped-source directory"},
+            "name": {"type": "string", "description": "sandbox kernel/spec name (default: source stem)"},
+            "dest": {"type": "string", "description": "relative destination under repos.sandbox"},
+            "generator": {"type": "string", "description": "host generator class to scrape"},
+            "axes": {"type": "object", "description": "focused shape axes, e.g. {\"q_len\": \"6,16\", \"past_len\": \"15360\"}"},
+            "overwrite": {"type": "boolean"}
+        },
+        "required": ["kernel"]
+    },
+)
+def _kernel_prepare(args: dict[str, Any]) -> Any:
+    plat = Platform.load()
+    runtime_kernel = kernelgen.runtime_symbol(args["kernel"])
+    src_path = _resolve_port_source(
+        plat, runtime_kernel, args.get("source"), args.get("dump_sources"),
+        args.get("profile_dump_dir")
+    )
+    src = kernelgen.parse_source(
+        src_path,
+        kernelgen.include_dirs_for(src_path, plat.production),
+    )
+    src.resolve_entry(runtime_kernel)
+    generator = args.get("generator") or kernelgen.guess_generator(src_path.stem)
+    hints = kernelgen.scrape_host(plat.production, generator)
+    name = args.get("name") or src_path.stem
+    dest = args.get("dest") or plat.kernelgen_dest
+    generated = kernelgen.prepare(
+        REPO_ROOT,
+        plat.sandbox,
+        dest,
+        src,
+        name,
+        hints,
+        overwrite=bool(args.get("overwrite")),
+        focus_axes=kernelgen.normalize_axes(args.get("axes")),
+    )
+    return {
+        "kernel": runtime_kernel,
+        "source": str(src_path),
+        "dest": dest,
+        "generator": generator,
+        "generated": generated,
+    }
+
+
+@server.tool(
+    "profile_prepare",
+    "Pick a hot kernel from a saved profile summary and immediately run kernel_prepare on it. "
+    "Defaults to the last recorded profile run and prefers steady-state generate kernels.",
+    {
+        "type": "object",
+        "properties": {
+            "dump_dir": {"type": "string", "description": "profile out_dir; defaults to the last recorded profile run"},
+            "summary": {"type": "string", "description": "explicit profile_summary.json path or one run directory"},
+            "pick": {"type": "integer", "description": "1-based rank inside the selected bucket (default 1)"},
+            "bucket": {"type": "string", "description": "selection bucket: main_generate, generate, global, etc."},
+            "name": {"type": "string"},
+            "dest": {"type": "string"},
+            "generator": {"type": "string"},
+            "axes": {"type": "object"},
+            "overwrite": {"type": "boolean"}
+        }
+    },
+)
+def _profile_prepare(args: dict[str, Any]) -> Any:
+    last_profile = results.last_profile()
+    out_dir = Path(args["dump_dir"]) if args.get("dump_dir") else (
+        Path(last_profile["out_dir"]) if last_profile and last_profile.get("out_dir") else None
+    )
+    if out_dir is None and not args.get("summary"):
+        raise ValueError("no profile output available; pass dump_dir/summary, or run profile_run first")
+    summary_path = Path(args["summary"]) if args.get("summary") else out_dir
+    summary = clintercept.load_profile_summary(summary_path)
+    selected = clintercept.pick_hot_kernel(summary, int(args.get("pick", 1)), args.get("bucket", ""))
+    prepared = _kernel_prepare({
+        "kernel": selected["kernel"],
+        "profile_dump_dir": str(out_dir) if out_dir else None,
+        "name": args.get("name"),
+        "dest": args.get("dest"),
+        "generator": args.get("generator"),
+        "axes": args.get("axes"),
+        "overwrite": args.get("overwrite"),
+    })
+    return {"selected": selected, **prepared}
 
 
 @server.tool(
@@ -254,9 +392,68 @@ def _ledger_add(args: dict[str, Any]) -> Any:
     return {"recorded": True}
 
 
-# `ckh profile run` is deliberately NOT exposed here: it executes an arbitrary user-supplied
-# pipeline command, which over a socket would be a remote-execution primitive. Collection
-# stays on the CLI; the model gets detection and analysis.
+# Profile collection executes a user-supplied pipeline, so HTTP requires explicit opt-in.
+
+@server.tool(
+    "profile_run",
+    "Run an e2e pipeline under cl_intercept and write a dump for profile_report. "
+    "Local stdio only by default; HTTP requires CKH_MCP_ALLOW_PROFILE_RUN=1. If `command` "
+    "is omitted, falls back to [profile].pipeline from platform.toml.",
+    {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "pipeline argv, e.g. [exe, main_model, draft_model, prompt, false]",
+            },
+            "out_dir": {"type": "string", "description": "output directory for cl_intercept dumps"},
+            "label": {"type": "string", "description": "run label, default run"},
+            "repeat": {"type": "integer", "description": "repeat count, default 2"},
+            "timeout": {"type": "integer", "description": "per-run timeout seconds, default 7200"},
+            "prefix": {"type": "string", "description": "cl_intercept install prefix"},
+            "dump_sources": {"type": "string", "description": "override OV_GPU_DUMP_SOURCES_PATH; default is <out_dir>/ov_gpu_dump_sources"},
+        },
+        "required": ["out_dir"],
+    },
+)
+def _profile_run(args: dict[str, Any]) -> Any:
+    if not _PROFILE_RUN_ALLOWED:
+        raise RuntimeError(
+            "profile_run is disabled for HTTP MCP unless CKH_MCP_ALLOW_PROFILE_RUN=1")
+    plat = _guarded_platform()
+    cfg = plat.raw.get("profile", {})
+    command = args.get("command") or cfg.get("pipeline") or []
+    if not isinstance(command, list) or not command or not all(
+            isinstance(x, str) and x for x in command):
+        raise ValueError(
+            "command must be a non-empty argv array of strings, or [profile].pipeline must "
+            "be set in platform.toml"
+        )
+    prefix = args.get("prefix") or cfg.get("install_prefix") or str(REPO_ROOT / "third_party")
+    tool = clintercept.locate(prefix, cfg.get("cliloader"))
+    if tool is None:
+        raise RuntimeError("cl_intercept not installed; run profile_status or ckh profile setup first")
+    repeat = int(args.get("repeat", 2))
+    if repeat < 1 or repeat > 10:
+        raise ValueError("repeat must be between 1 and 10")
+    timeout = int(args.get("timeout", 7200))
+    runs = clintercept.run(
+        tool,
+        Path(args["out_dir"]),
+        args.get("label") or "run",
+        command,
+        repeat=repeat,
+        env=cfg.get("pipeline_env") or None,
+        timeout=timeout,
+        dump_sources=args.get("dump_sources"),
+    )
+    ok = all(r["exit_code"] == 0 and r["trace_present"] for r in runs)
+    dump_sources_path = runs[0].get("dump_sources") if runs else None
+    if dump_sources_path:
+        results.record_last_profile(str(Path(args["out_dir"])), dump_sources_path, runs)
+    return {"ok": ok, "out_dir": args["out_dir"], "runs": runs,
+            "dump_sources": dump_sources_path}
 
 @server.tool(
     "profile_status",
@@ -292,9 +489,10 @@ def _profile_status(args: dict[str, Any]) -> Any:
                                       "split is a decision and this is its knob"},
             "gap_ms": {"type": "number", "description": "silence that separates two cycles"},
             "drop_cycles": {"type": "integer", "description": "warm-up iterations to discard"},
-            "dflash": {"type": "boolean", "description": "report the configured dflash pattern"},
-            "dflash_main_config": {"type": "string"},
-            "dflash_draft_config": {"type": "string"},
+            "speculative": {"type": "boolean",
+                            "description": "report the configured main/draft speculative-decoding pattern"},
+            "speculative_main_config": {"type": "string"},
+            "speculative_draft_config": {"type": "string"},
         },
         "required": ["dump_dir"],
     },
@@ -310,23 +508,22 @@ def _profile_report(args: dict[str, Any]) -> Any:
         seg.split_kernel = args["anchor"]
     out = []
     for t in traces:
-        if args.get("dflash"):
-            cfg = Platform.load().raw.get("profile", {}).get("dflash", {})
-            main_config = args.get("dflash_main_config") or cfg.get("main_config")
-            draft_config = args.get("dflash_draft_config") or cfg.get("draft_config")
+        if args.get("speculative"):
+            cfg = Platform.load().raw.get("profile", {}).get("speculative", {})
+            main_config = args.get("speculative_main_config") or cfg.get("main_config")
+            draft_config = args.get("speculative_draft_config") or cfg.get("draft_config")
             if not main_config or not draft_config:
-                raise ValueError("dflash requires profile.dflash main_config and draft_config")
-            spec = clintercept.DFlashPatternSpec(
+                raise ValueError("speculative requires profile.speculative main_config and draft_config")
+            spec = clintercept.SpeculativePatternSpec(
                 main_layers=clintercept.load_num_hidden_layers(Path(main_config)),
                 draft_layers=clintercept.load_num_hidden_layers(Path(draft_config)),
                 main_full_attention_layers=clintercept.load_full_attention_layers(
                     Path(main_config)),
-                cm_regex=cfg.get("cm_regex", r"cm_sdpa_vlen"),
-                main_regex=cfg.get("main_regex", r"sdpa_micro__generate|paged_attention_opt"),
+                main_regex=cfg.get("main_regex", r"sdpa_micro__generate|paged_attention_opt|cm_sdpa_vlen"),
                 draft_regex=cfg.get("draft_regex", r"sdpa_micro__prefill"),
                 gap_ms=float(cfg.get("gap_ms", 50.0)))
-            res = clintercept.analyze_dflash(t, spec)
-            out.append({"table": clintercept.render_dflash(res),
+            res = clintercept.analyze_speculative(t, spec)
+            out.append({"table": clintercept.render_speculative(res),
                         "patterns": res["patterns"], "warnings": res["warnings"]})
             continue
         res = clintercept.analyze(t, args.get("kernel", ""), seg)
@@ -358,6 +555,11 @@ def main() -> int:
     use_http = (args.http
                 or os.environ.get("MCP_TRANSPORT", "").lower() == "http"
                 or os.environ.get("CKH_HTTP", "").lower() in {"1", "true", "yes"})
+    global _PROFILE_RUN_ALLOWED
+    _PROFILE_RUN_ALLOWED = (
+        not use_http
+        or os.environ.get("CKH_MCP_ALLOW_PROFILE_RUN", "").lower() in {"1", "true", "yes"}
+    )
     if use_http:
         return server.serve_http(args.host, args.port)
     return server.serve_stdio()

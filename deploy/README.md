@@ -8,21 +8,47 @@ hardcoded**.
 
 | File | Role |
 |------|------|
-| `deploy_ckh.sh` | one command, two lanes: local venv + stdio config, or rsync → remote venv → systemd → health check |
+| `setup_local_mcp.py` | canonical one-run local setup with platform auto-detection: `.venv`, editable install, `platform.toml`, `.mcp.json`, `.vscode/mcp.json`, handshake |
+| `setup_local_mcp.sh` | Unix-like wrapper for `setup_local_mcp.py` |
+| `setup_local_mcp.ps1` | Windows wrapper for `setup_local_mcp.py` |
+| `deploy_ckh.sh` | remote Linux deployment: rsync → remote venv → systemd/nohup → health check |
 | `run_ckh.sh` | the runner on the GPU box (`python -m ckh.mcp --http`), env-driven |
 | `ckh.service` | systemd user unit template (`@INSTALL_DIR@` / `@PORT@` substituted at deploy) |
 | `configure_mcp_client.sh` | render `.vscode/mcp.json` from the committed template + `.env` |
 | `_env.sh` | the `.env` parsing rules, stated once |
 
-## Which lane
+## Local setup
+
+Use one canonical local bootstrap on both Windows and Unix-like systems:
+
+```bash
+python deploy/setup_local_mcp.py
+```
+
+Platform-native wrappers are also available:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\setup_local_mcp.ps1
+```
+
+```bash
+bash deploy/setup_local_mcp.sh
+```
+
+The script auto-detects the platform and configures the local stdio MCP lane without asking
+the user to choose an OS-specific path.
+
+## Remote lane
+
+Note: the remote HTTP deployment path is still under development. Prefer the local stdio lane
+unless you specifically need a separate Linux GPU host and are prepared to validate that
+environment yourself.
 
 The server must run **on the box that has the GPU** — every tool compiles and runs a CM
 kernel, so there is no "deploy it to a server and point it at a GPU".
 
 ```bash
 cp .env.example .env
-
-bash deploy/deploy_ckh.sh --local    # GPU is in this box  -> stdio, nothing on a socket
 bash deploy/deploy_ckh.sh            # CKH_REMOTE_HOST set -> ship to that box, serve HTTP
 ```
 

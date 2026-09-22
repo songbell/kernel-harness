@@ -3,10 +3,17 @@ name: cm-kernel-opt
 description: End-to-end workflow for developing and optimizing an Intel CM (C-for-Metal) GPU kernel in the aboutSHW sandbox and then integrating it into the OpenVINO GPU plugin. Use when asked to optimize, profile, or extend a pa_* / cm_* kernel, when a kernel-level performance regression is reported, or when a new kernel must be built for the intel_gpu CM path. Covers roofline analysis, ablation budgeting, bit-exactness verification, parameter calibration and plugin integration.
 ---
 
-# CM kernel: develop in the sandbox, then integrate
+# CM kernel optimization overview
 
-Flow diagram, artifact/versioning map and the container measurement loop: **`WORKFLOW.md`**
-in this directory.
+This file is the short human-readable overview of the optimization method. The runtime
+sources of truth are:
+
+- `../../workflows/performance-optimization.workflow.yaml` for the role graph
+- `../../workflows/performance-optimization.policy.yaml` for intake rules, hard rules,
+  step contracts, and loop policy
+
+Flow diagram, artifact/versioning map and the container measurement loop live in
+**`WORKFLOW.md`** in this directory.
 
 Two-repo workflow. The kernel is developed and measured in `aboutSHW`, then ported to
 `openvino`. **They are different files** and results do not automatically transfer.
@@ -33,6 +40,10 @@ Two-repo workflow. The kernel is developed and measured in `aboutSHW`, then port
 
 Run in order. Each phase's output decides whether the next is worth doing.
 
+**0. `rig-warden` / `ckh-doctor`** — check for competing GPU work, pick the environment, and
+establish the noise floor before launching the real pipeline. *Nothing below this line is
+trustworthy without it.*
+
 **P. `pre-profiler`** — *only when the target kernel is not already fixed by the user.* Run the
 real e2e pipeline under cl_intercept (`ckh profile setup|run|report`), split the timeline into
 prefill and generate, and report each kernel's share of its phase. That share is the **Amdahl
@@ -40,9 +51,6 @@ ceiling** on any e2e win. → share too small : stop here, and say so.
 The pipeline command comes from `[profile].pipeline` in `platform.toml`, or you ask the user
 for it — in the main conversation, before dispatching any subagent, since a subagent cannot
 ask. Always pass `--no-prompt` so the CLI never blocks on stdin.
-
-**0. `rig-warden`** — check for competing GPU work, pick the environment, establish the noise
-floor. *Nothing below this line is trustworthy without it.*
 
 **1. `roofline-analyst`** — measure the device's roofs empirically, separate compulsory
 traffic from algorithm artifacts, report `current / floor`.

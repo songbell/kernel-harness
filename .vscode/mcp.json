@@ -2,7 +2,11 @@
   "servers": {
     "ckh": {
       "type": "stdio",
-      "command": "${workspaceFolder}/deploy/ckh-mcp-vscode",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "-m",
+        "ckh.mcp"
+      ],
       "cwd": "${workspaceFolder}"
     }
   }

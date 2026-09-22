@@ -1,4 +1,4 @@
-# Optimizing a kernel with this harness
+so# Optimizing a kernel with this harness
 
 Written for an engineer picking up a CM kernel they did not write. Follow the order; the
 gates matter more than the steps, and most of the value is in *not* proceeding.
@@ -15,23 +15,12 @@ says which.
 git clone <this repo> && cd cm-kernel-harness
 cp platform.example.toml platform.toml && $EDITOR platform.toml   # your kernel repo paths
 pip install -e .
-pip install -e /path/to/aboutSHW/opencl                         # the clops binding used by measurements
 ckh doctor
 ```
-
-The second install is required when `exec.clops_path` is empty. It installs the `clops`
-package from the sandbox checkout named by `repos.sandbox`; `pybind11` is installed by the
-harness itself because clops imports it during measurement setup. If `exec.clops_path` points
-at a checkout that already provides clops, keep the harness install and skip the editable
-clops install.
 
 `ckh doctor` must print `competing work none`. If it lists anything, stop — a benchmark
 running in parallel once produced `ablation_off > ablation_on`, a physically impossible
 ordering, and invalidated a whole batch of results.
-
-Optional, if you work with Claude Code: `.claude/skills/cm-kernel-opt/install.sh <workspace>`
-links the role definitions into your workspace. They also read fine as human checklists —
-each one names the specific failure it exists to prevent.
 
 ---
 
@@ -62,8 +51,8 @@ for your kernel means it was never enqueued (check the feature flag and the buil
 concurrency factor above 1 means queues overlap, so the share bounds *device work* and the
 wall-clock win is smaller still.
 
-Collection is CLI-only on purpose — `profile run` executes an arbitrary command, so it is not
-exposed as an MCP tool.
+Collection is available to the local stdio MCP server as `ckh.profile_run`. HTTP exposure is
+disabled unless `CKH_MCP_ALLOW_PROFILE_RUN=1`, because it executes an arbitrary command.
 
 ---
 
@@ -158,7 +147,7 @@ Then branch:
 
 ## Step 5 — is the algorithm right *for this shape*? (manual)
 
-Read `.claude/agents/algorithm-critic.md`. Trigger signs, all observed in practice:
+Read `.github/agents/ckh-algorithm-critic.agent.md`. Trigger signs, all observed in practice:
 
 - A traffic term you labelled "artifact" is large.
 - The same constant is optimal at one shape and 3x wrong at another — that is a decomposition
@@ -258,7 +247,7 @@ value** — a guard only ever seen to pass is not known to work. Reference:
 4. If it breaks, **single-variable bisect**, and establish the baseline first. Four changes
    were in flight once; reverting them one at a time isolated the culprit in four builds.
 
-Known host-side traps are listed in `.claude/agents/integrator.md` — index aliasing between
+Known host-side traps are listed in `.github/agents/ckh-integrator.agent.md` — index aliasing between
 stage arrays, includes needing to sit inside a namespace, exception-swallowing registration,
 and JIT constants that cannot follow runtime state.
 

@@ -12,7 +12,28 @@ exposes the same guarded workflow as the CLI: `doctor`, `list_kernels`, `validat
 ## Setup
 
 1. Work from the repository root: `~/bell/kernel-harness`.
-2. Check that the editable package and MCP entry point are available:
+2. Prefer the one-run local bootstrap on every platform:
+
+  ```bash
+  python deploy/setup_local_mcp.py
+  ```
+
+  It auto-detects the platform, creates `.venv`, installs the repo, writes `.mcp.json` and
+  `.vscode/mcp.json`, and verifies the MCP handshake.
+
+  Native wrappers exist if preferred:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\deploy\setup_local_mcp.ps1
+  ```
+
+  ```bash
+  bash deploy/setup_local_mcp.sh
+  ```
+
+  After it finishes, reload VS Code and run `ckh doctor`.
+
+3. If you are not using the bootstrap script, check that the editable package and MCP entry point are available:
 
    ```bash
    command -v ckh
@@ -20,9 +41,9 @@ exposes the same guarded workflow as the CLI: `doctor`, `list_kernels`, `validat
    python -c 'import ckh; print(ckh.__file__)'
    ```
 
-3. Do not assume the shell's `python` is the right interpreter. Select the interpreter that
+4. Do not assume the shell's `python` is the right interpreter. Select the interpreter that
    can import `ckh`, for example `/home/openvino-ci-97/miniforge3/bin/python`.
-4. Use the tracked workspace MCP files. `.mcp.json` is read natively by Agent Host, and
+5. Use the tracked workspace MCP files. `.mcp.json` is read natively by Agent Host, and
    `.vscode/mcp.json` is read by VS Code workspace MCP support. Both should point at the repository
    wrapper script:
 
@@ -42,7 +63,7 @@ exposes the same guarded workflow as the CLI: `doctor`, `list_kernels`, `validat
    `python`, and adds `src` to `PYTHONPATH`. This avoids a bare `ckh-mcp` failing when the VS Code
    process has a different `PATH` from the shell.
 
-5. Reload the VS Code window. The configuration is workspace-local and should not be treated as
+6. Reload the VS Code window. The configuration is workspace-local and should not be treated as
    a portable machine-independent file when it contains user-specific paths.
 
 ## Verification

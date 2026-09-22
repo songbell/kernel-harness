@@ -226,7 +226,7 @@ def generate(name: str) -> Path:
         ")\n\n"
         f"DEFAULT_AXES = {default_axes_src}\n\n"
         "# jit/dispatch/args/outputs/SPEC come once a CM kernel exists for this --\n"
-        "# see .claude/agents/kernel-onboarder.md\n"
+        "# see .github/agents/ckh-kernel-onboarder.agent.md\n"
     )
 
     out_path.write_text(header + body)

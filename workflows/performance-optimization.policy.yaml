@@ -1,0 +1,304 @@
+policy:
+  id: cm-kernel-performance-optimization-policy
+  version: 1.0.0
+  description: "Runtime policy for the CKH performance-optimization graph: intake, hard rules, step contracts, and adoption criteria."
+
+intake_policy:
+  preferred_entry: pipeline
+  fallback_entry: known_kernel
+  rules:
+    - "If the user supplies a pipeline, parse it as exact argv and persist it to [profile].pipeline in platform.toml."
+    - "If the user does not supply a pipeline, ask for one unless they already know the target kernel."
+    - "Prefer the pipeline path over the known-kernel path because it preserves end-to-end hot-spot selection."
+    - "Never rely on a CLI stdin prompt to acquire the pipeline."
+
+hard_rules:
+  - "Measure the noise floor before quoting any effect."
+  - "An unmeasured hypothesis is not a conclusion."
+  - "Benchmarking requires a prior equivalence pass and a non-vacuous negative control."
+  - "Effects inside the noise floor are not resolvable results."
+  - "The sandbox kernel is not the shipped kernel; integration must re-verify on the real pipeline."
+  - "Any rounding-changing optimization requires explicit user approval and is skipped in unattended mode."
+  - "Constants are calibrated over a domain, never at a point."
+  - "Workflow steps are strictly sequential: never dispatch adjacent or dependent steps concurrently."
+  - "The next delegate receives the prior delegate's returned artifacts and gate verdict before it starts."
+
+backend_blockers:
+  mcp_unavailable:
+    trigger: "A required `ckh/*` tool still cannot be invoked after one `tool_search` attempt to load the deferred CKH MCP tools for the current session."
+    action: "Stop immediately before any further workflow narration or delegation."
+    user_message:
+      - "CKH MCP tools are unavailable in this session, so the harness cannot run doctor/profile/bench deterministically."
+      - "Recovery:"
+      - "1. Run `python deploy/setup_local_mcp.py`"
+      - "2. Reload VS Code"
+      - "3. Approve the MCP trust prompt"
+      - "4. Run `MCP: List Servers` and confirm `ckh` is enabled"
+      - "Then retry the same request."
+    forbid:
+      - "Do not treat deferred-tool absence as final before attempting the session-local `tool_search` load."
+      - "Do not continue to subagents after this blocker."
+      - "Do not emit pseudo-step logs or planned-step narration after this blocker."
+      - "Do not infer rig, profile, or optimization state without CKH evidence."
+
+step_contracts:
+  gatekeeper:
+    purpose: "Establish rig readiness, competing-work status, and measurement noise floor."
+    required_inputs:
+      - platform.toml machine facts
+    required_evidence:
+      - ckh.doctor result from this session
+    outputs:
+      - ready
+      - backend
+      - noise_floor_pct
+      - competing_gpu_work
+    stop_conditions:
+      - "Rig not ready."
+      - "Competing GPU work is present."
+
+  preflight:
+    purpose: "Resolve unattended profile collection settings for an exact pipeline argv."
+    required_inputs:
+      - exact pipeline argv
+      - profile install_prefix / cliloader config
+    required_evidence:
+      - ckh.profile_status result
+      - deterministic speculative-detection evidence when relevant
+    outputs:
+      - command
+      - out_dir
+      - label
+      - repeat
+      - timeout
+      - speculative_main_config
+      - speculative_draft_config
+      - warnings
+    stop_conditions:
+      - "Profiler unavailable."
+      - "Speculative config is required but cannot be resolved unambiguously."
+
+  collector:
+    purpose: "Collect repeated cl_intercept traces for the exact pipeline."
+    required_inputs:
+      - exact pipeline argv
+      - collection settings from preflight
+    required_evidence:
+      - ckh.profile_run result
+    outputs:
+      - dump_dir
+      - runs
+      - ok
+    stop_conditions:
+      - "Exact argv missing or invalid."
+      - "Any required run fails or produces no trace artifact."
+
+  reporter:
+    purpose: "Identify the defensible hot kernel and its Amdahl ceiling from repeated profile traces."
+    required_inputs:
+      - collector.output.dump_dir from the immediately preceding collector step
+      - collector.output.runs and app_metrics from the immediately preceding collector step
+      - exact pipeline argv
+      - optional speculative config paths from preflight.output
+    required_evidence:
+      - ckh.profile_report output
+      - app metrics attached to collected runs
+    outputs:
+      - mode
+      - hot_kernel
+      - top_kernels
+      - dump_sources
+      - device_runtime_share
+      - amdahl_ceiling
+      - warnings
+    stop_conditions:
+      - "Collector output dump_dir or runs are missing; do not search for or regenerate a profile dump."
+      - "Traces are invalid, incomplete, or too unstable to support a hot-kernel claim."
+      - "The Amdahl ceiling is too small to justify kernel work."
+
+  kernel_selection:
+    owner: coordinator
+    purpose: "Let the user choose which profiled kernel to optimize before any kernel-level work starts."
+    required_inputs:
+      - reporter.output.top_kernels
+      - reporter.output.dump_sources
+    required_evidence:
+      - measured per-kernel share and Amdahl ceiling from this run
+    outputs:
+      - selected_kernel
+      - selected_kernel_share
+    rules:
+      - "Present the measured top-k kernels with device-time share and Amdahl ceiling, ranked by measured share."
+      - "Ask the user to choose exactly one kernel; never auto-select when the choice is offered."
+      - "Carry the chosen kernel identity and the dumped OpenVINO source directory into the onboarder step."
+    stop_conditions:
+      - "The reporter produced no ranked kernel list."
+      - "The user declines to select a kernel."
+
+  onboarder:
+    purpose: "Generate and validate the sandbox surface for the user-selected profiled kernel."
+    required_inputs:
+      - kernel_selection.output.selected_kernel
+      - reporter.output.dump_sources
+      - production plugin source path
+    required_evidence:
+      - ckh.kernel_prepare output generated from the dumped OpenVINO sources
+    outputs:
+      - sandbox_spec_path
+      - derived_inputs
+      - guessed_inputs
+    rules:
+      - "Always generate the port for the selected kernel; ledger entries and existing sandbox specs are advisory only."
+      - "When a sandbox spec already exists, regenerate from this run's dumped source and report the divergence."
+    stop_conditions:
+      - "No dumped kernel source for the selected kernel exists in the provided profile artifacts."
+      - "Onboarding would require invented launch data or invented reference inputs."
+
+  roofline:
+    purpose: "Measure the kernel's physical floor and decide whether the decomposition needs review."
+    required_inputs:
+      - hot kernel identity
+      - measured shape
+      - noise floor verdict
+    required_evidence:
+      - measured roofs and current timing from this session
+    outputs:
+      - binding_roof
+      - measured_floor
+      - gap
+      - requires_algorithm_review
+    stop_conditions:
+      - "Measured roofs unavailable for this session."
+      - "Current timing or traffic terms would need invented values."
+
+  critic:
+    purpose: "Challenge the kernel decomposition when the measured gap suggests algorithmic mismatch."
+    required_inputs:
+      - roofline gap
+      - shape-sensitive evidence
+    required_evidence:
+      - roofline result
+      - per-shape variance evidence
+    outputs:
+      - hypothesis
+      - discriminating_measurement
+    stop_conditions:
+      - "Evidence does not support a decomposition-level hypothesis."
+      - "The next discriminating step would require redesign rather than measurement."
+
+  budgeter:
+    purpose: "Produce a measured runtime budget with reversible ablation probes."
+    required_inputs:
+      - kernel under test
+      - measured shape
+      - prior ledger findings
+    required_evidence:
+      - probe self-checks
+      - ckh bench / trial results
+      - optional ckh kernel-profile ranking
+    outputs:
+      - ranked_terms
+      - candidate_changes
+    stop_conditions:
+      - "Probe-off does not reproduce baseline."
+      - "The probe is not cheaper than what it removes."
+
+  classifier:
+    purpose: "Classify a candidate as bit-exact or rounding-changing before implementation."
+    required_inputs:
+      - exact candidate transformation
+    required_evidence:
+      - source-level dataflow and operation ordering
+    outputs:
+      - bit_exact
+      - rationale
+    stop_conditions:
+      - "Candidate is rounding-changing."
+      - "Candidate is underspecified and cannot be classified honestly."
+
+  optimizer:
+    purpose: "Implement one measured bit-exact candidate in the sandbox."
+    required_inputs:
+      - candidate selected from the measured budget
+      - bit-exact classification
+    required_evidence:
+      - minimal code diff
+    outputs:
+      - changed_files
+      - changed_numeric_constant
+    stop_conditions:
+      - "No bit-exact classification is available."
+      - "Candidate would require broad unrelated edits."
+
+  prover:
+    purpose: "Prove correctness and prove the check can fail."
+    required_inputs:
+      - changed sandbox candidate
+      - correctness shape set
+    required_evidence:
+      - ckh.equiv result
+      - deliberately broken negative control
+    outputs:
+      - passed
+      - non_vacuous
+    stop_conditions:
+      - "Equivalence fails."
+      - "Negative control does not prove the check can fail."
+
+  benchmarker:
+    purpose: "Measure candidate versus baseline with interleaved timing and a noise-floor verdict."
+    required_inputs:
+      - passed candidate
+      - baseline
+      - shapes
+      - noise_floor_pct
+    required_evidence:
+      - ckh.round or trial finalize result
+    outputs:
+      - adopted
+      - delta
+      - spread
+    stop_conditions:
+      - "Equivalence has not passed."
+      - "Measured effect is inside the established noise floor."
+
+  tuner:
+    purpose: "Calibrate a changed numeric constant across its supported domain."
+    required_inputs:
+      - changed numeric constant
+      - supported shape domain
+    required_evidence:
+      - equivalence and interleaved timing sweep
+    outputs:
+      - selected_value
+      - regression_guard
+    stop_conditions:
+      - "The candidate did not actually change a numeric constant."
+      - "The full domain cannot be covered with equivalence and timing evidence."
+
+  integrator:
+    purpose: "Port the adopted sandbox diff to production and verify it end to end."
+    required_inputs:
+      - adopted sandbox diff
+      - original exact pipeline argv
+      - baseline comparison point
+    required_evidence:
+      - production build result
+      - output text
+      - accepted-token count
+      - final interleaved performance result
+    outputs:
+      - integrated
+      - ledger_recorded
+      - final_verdict
+    stop_conditions:
+      - "Sandbox and production differences cannot be reconciled."
+      - "Output, accepted-token count, or final timing contradict adoption."
+
+loop_policy:
+  optimization_loop:
+    adoption_condition: "benchmarker.output.adopted == true"
+    continue_condition: "benchmarker.output.adopted != true"
+    notes:
+      - "Reject unresolved or slower candidates in the ledger before advancing to the next one."
+      - "Never benchmark before equivalence and its negative control pass."

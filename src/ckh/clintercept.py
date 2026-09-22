@@ -19,10 +19,23 @@ import urllib.request
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Mapping
 
 DEFAULT_VERSION = "3.0.6"
 RELEASE_URL = "https://github.com/intel/opencl-intercept-layer/releases/download/v{v}/clintercept-{v}-{platform}.{extension}"
+
+HARNESS_STAGES = frozenset({
+    "profile",
+    "kernelgen",
+    "validate",
+    "kernel-profile",
+    "bench",
+    "equiv",
+    "round",
+    "snapshot",
+})
 
 # -cdt is the per-queue device timeline (the JSON carrying per-kernel dur) and is required.
 # -dv is the aggregate report, a cheap cross-check on it.
@@ -33,19 +46,61 @@ DEFAULT_FLAGS = ("-cdt", "-dv")
 MEM_RE = re.compile(r"^clEnqueue", re.I)
 
 
+def prepare_profile_env(out_dir: Path, env: dict[str, str] | None = None,
+                        dump_sources: str | None = None) -> tuple[dict[str, str], Path]:
+    """Return a profile env with OV_GPU_DUMP_SOURCES_PATH guaranteed to be set."""
+    merged = dict(env or {})
+    dump_path = Path(dump_sources or merged.get("OV_GPU_DUMP_SOURCES_PATH")
+                     or (out_dir / "ov_gpu_dump_sources"))
+    dump_path.mkdir(parents=True, exist_ok=True)
+    merged["OV_GPU_DUMP_SOURCES_PATH"] = str(dump_path)
+    return merged, dump_path
+
+def model_for_stage(stage: str, models: Mapping[str, str],
+                    stage_models: Mapping[str, str]) -> str:
+    """Return the configured model path for a named pipeline stage.
+
+    ``models`` maps stable roles such as ``router`` and ``reasoner`` to model paths;
+    ``stage_models`` maps CKH workflow stages such as ``profile`` and ``kernelgen`` to
+    those names. Both lookups are strict so a typo cannot silently select the wrong model.
+    """
+    stage = stage.strip()
+    if not stage:
+        raise ValueError("stage must not be empty")
+    if stage not in HARNESS_STAGES:
+        raise KeyError(f"unknown CKH stage '{stage}'")
+    model_name = stage_models.get(stage)
+    if not model_name:
+        raise KeyError(f"no model configured for stage '{stage}'")
+    model_path = models.get(model_name)
+    if not model_path:
+        raise KeyError(f"stage '{stage}' references unknown model '{model_name}'")
+    return model_path
+
+
 class Refused(RuntimeError):
     """Raised when proceeding would produce a number that cannot be trusted."""
 
 
 @dataclass(frozen=True)
-class DFlashPatternSpec:
-    """The three attention groups emitted by one dflash iteration."""
+class SpeculativePatternSpec:
+    """The main and draft attention groups emitted by one speculative-decoding iteration.
+
+    Classification is regex-based only: `main_regex`/`draft_regex` match whatever device
+    kernel names the pipeline actually enqueues (OpenVINO's built-in micro-SDPA kernels, a
+    CM kernel, or anything else) -- no specific implementation is assumed or required.
+
+    Both regexes are OPTIONAL and default to None: this module must not guess a kernel name
+    that happens to work on one pipeline. Without a regex for a side, `analyze_speculative`
+    cannot count that side's attention calls or iterations -- instead it reports that side's
+    hot-spot kernels (top device time), so the report is still useful and the regex can be
+    picked from real evidence rather than guessed up front.
+    """
     main_layers: int
     draft_layers: int
     main_full_attention_layers: int | None = None
-    cm_regex: str = r"cm_sdpa_vlen"
-    main_regex: str = r"sdpa_micro__generate|paged_attention_opt"
-    draft_regex: str = r"sdpa_micro__prefill"
+    main_regex: str | None = None
+    draft_regex: str | None = None
     gap_ms: float = 50.0
 
 
@@ -70,6 +125,78 @@ def load_full_attention_layers(config: Path) -> int:
             if count:
                 return count
     return load_num_hidden_layers(config)
+
+
+# -- speculative-decoding inference ------------------------------------------------------
+
+_SPECULATIVE_NAME_RE = re.compile(r"speculat|dflash|draft", re.I)
+
+
+def infer_speculative_pipeline(pipeline: list[str], max_depth: int = 3) -> dict:
+    """Guess whether `pipeline` is a speculative-decoding run and locate its main/draft
+    `config.json`, from the argv alone -- no execution, no network.
+
+    This is deliberately conservative: it reports its confidence and every ambiguity it
+    found rather than picking a config.json to be helpful. A caller (subagent or human)
+    decides whether "heuristic" confidence is good enough to act on; this function never
+    is that caller.
+    """
+    result = {"is_speculative": False, "confidence": "none", "reason": "", "candidates": [],
+              "warnings": []}
+    if not pipeline:
+        result["reason"] = "empty pipeline"
+        return result
+
+    exe_hint = bool(_SPECULATIVE_NAME_RE.search(Path(pipeline[0]).stem))
+    dirs = [arg for arg in pipeline[1:] if Path(arg).is_dir()]
+
+    if not exe_hint and len(dirs) < 2:
+        result["reason"] = ("binary name has no speculative/dflash/draft hint and fewer than "
+                            "2 directory-shaped args were found")
+        return result
+
+    result["is_speculative"] = True
+    result["confidence"] = "high" if exe_hint else "low"
+    result["reason"] = (f"binary name matched /{_SPECULATIVE_NAME_RE.pattern}/" if exe_hint
+                        else f"{len(dirs)} directory-shaped args, no binary-name hint")
+    if len(dirs) < 2:
+        result["warnings"].append(
+            f"only {len(dirs)} directory-shaped arg(s) found; cannot pair a main and a draft "
+            f"model directory")
+        return result
+    if len(dirs) > 2:
+        result["warnings"].append(
+            f"{len(dirs)} directory-shaped args found; assuming the FIRST TWO, in argv order, "
+            f"are main then draft -- confirm before trusting")
+
+    for role, model_dir in zip(("main", "draft"), dirs[:2]):
+        d = Path(model_dir)
+        entry = {"role": role, "dir": str(d), "config": None, "config_candidates": []}
+        direct = d / "config.json"
+        if direct.is_file():
+            entry["config"] = str(direct)
+        else:
+            found = []
+            for depth in range(1, max_depth + 1):
+                pattern = "/".join(["*"] * depth + ["config.json"])
+                found = sorted(d.glob(pattern))
+                if found:
+                    break
+            if len(found) == 1:
+                entry["config"] = str(found[0])
+            elif len(found) > 1:
+                entry["config_candidates"] = [str(f) for f in found]
+                result["warnings"].append(
+                    f"{role} dir {d} has {len(found)} config.json candidates under it -- "
+                    f"refusing to guess which one")
+            else:
+                result["warnings"].append(f"no config.json found under {role} dir {d} "
+                                          f"(searched {max_depth} levels deep)")
+        result["candidates"].append(entry)
+    result["warnings"].append(
+        "main/draft role assignment is POSITIONAL (first dir = main, second = draft) -- this "
+        "is the convention for this pipeline's argv, not a property this function can verify")
+    return result
 
 
 # -- locate / install ------------------------------------------------------------------
@@ -166,7 +293,8 @@ def smoke(cli: Path) -> list[str]:
 
 def run(cli: Path, out_dir: Path, label: str, command: list[str],
         flags: tuple[str, ...] = DEFAULT_FLAGS, repeat: int = 1,
-        env: dict[str, str] | None = None, timeout: int = 7200) -> list[dict]:
+    env: dict[str, str] | None = None, timeout: int = 7200,
+    dump_sources: str | None = None) -> list[dict]:
     """Launch the pipeline under cliloader `repeat` times.
 
     `command` is run verbatim: this module does not know what the user's pipeline is and
@@ -174,6 +302,12 @@ def run(cli: Path, out_dir: Path, label: str, command: list[str],
     running -- see Platform.competing_gpu_work.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    profile_env, dump_sources_path = prepare_profile_env(out_dir, env, dump_sources)
+    (out_dir / "profile_run.json").write_text(json.dumps({
+        "dump_sources": str(dump_sources_path),
+        "command": command,
+        "repeat": repeat,
+    }, indent=2))
     runs = []
     for r in range(1, repeat + 1):
         tag = label if repeat == 1 else f"{label}_r{r}"
@@ -182,7 +316,7 @@ def run(cli: Path, out_dir: Path, label: str, command: list[str],
         log = out_dir / f"{tag}.log"
         e = dict(os.environ)
         e.update({"NEOReadDebugKeys": "1", "EnableCopyWithStagingBuffers": "1"})
-        e.update(env or {})
+        e.update(profile_env)
         with log.open("w") as fh:
             rc = subprocess.run([str(cli), *flags, "--dump-dir", str(dump), *command],
                                 stdout=fh, stderr=subprocess.STDOUT, env=e,
@@ -194,7 +328,8 @@ def run(cli: Path, out_dir: Path, label: str, command: list[str],
             f"exit_code={rc}\n" + "".join(f"{k}={v}\n" for k, v in metrics.items()))
         traced = any(p.stat().st_size > 0 for p in dump.rglob("clintercept_trace.json"))
         runs.append({"tag": tag, "dump": str(dump), "log": str(log), "exit_code": rc,
-                     "app_metrics": metrics, "trace_present": traced})
+                 "app_metrics": metrics, "trace_present": traced,
+                 "dump_sources": str(dump_sources_path)})
     return runs
 
 
@@ -270,60 +405,325 @@ def _span_ms(evs) -> float:
     return (max(ts + d for ts, d, _ in evs) - min(ts for ts, _, _ in evs)) / 1000.0
 
 
-def analyze_dflash(trace: Path, spec: DFlashPatternSpec) -> dict:
-    """Find dflash iterations as cm_sdpa_vlen + main attention + draft attention.
+def _classify_by_call_count(rows: list[dict], main_layers: int, draft_layers: int
+                            ) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split hot-spot rows into main/draft/unclassified using call-count divisibility only.
 
-    The trace does not carry model ownership, so classification is deliberately regex- and
-    count-based. A result is marked incomplete instead of silently assigning events to the
-    wrong model when a layer sequence is truncated or interleaved.
+    No kernel name is ever inspected here. Main and draft models are almost always
+    different sizes, so their compiled kernel variants get different call counts per
+    iteration -- a kernel whose total `calls` divides evenly by exactly one side's layer
+    count is (heuristically) that side's. A count divisible by BOTH, or by NEITHER, is
+    reported unclassified rather than guessed.
     """
-    raw = _absolute(_load_events(trace))
+    main_rows, draft_rows, other_rows = [], [], []
+    for row in rows:
+        calls = row["calls"]
+        is_main = bool(main_layers) and calls % main_layers == 0
+        is_draft = bool(draft_layers) and calls % draft_layers == 0
+        if is_main and not is_draft:
+            main_rows.append(row)
+        elif is_draft and not is_main:
+            draft_rows.append(row)
+        else:
+            other_rows.append(row)
+    return main_rows, draft_rows, other_rows
+
+
+_PREFILL_FAMILY_RE = re.compile(r"sdpa_micro__prefill|paged_attention|cm_pa", re.I)
+_GENERATE_FAMILY_RE = re.compile(r"sdpa_micro__generate|paged_attention|cm_pa", re.I)
+
+
+def _speculative_phase_name_sets(rows: list[dict], main_layers: int, draft_layers: int) -> dict[str, set[str]]:
+    names = {
+        "main_prefill": set(),
+        "draft_generate": set(),
+        "main_generate": set(),
+    }
+    for row in rows:
+        kernel = row["kernel"]
+        calls = row["calls"]
+        main_div = bool(main_layers) and calls % main_layers == 0
+        draft_div = bool(draft_layers) and calls % draft_layers == 0
+        if _PREFILL_FAMILY_RE.search(kernel):
+            if main_div and not draft_div:
+                names["main_prefill"].add(kernel)
+            elif draft_div and not main_div:
+                names["draft_generate"].add(kernel)
+        if _GENERATE_FAMILY_RE.search(kernel) and main_div:
+            names["main_generate"].add(kernel)
+    return names
+
+
+def _bucket_for_event(name: str, phase_names: dict[str, set[str]]) -> str | None:
+    for bucket in ("main_prefill", "draft_generate", "main_generate"):
+        if name in phase_names[bucket]:
+            return bucket
+    return None
+
+
+def _attention_windows(evs, phase_names: dict[str, set[str]]) -> list[dict]:
+    windows = []
+    attention = []
+    for ts, dur, name in evs:
+        bucket = _bucket_for_event(name, phase_names)
+        if bucket is None:
+            continue
+        attention.append((ts, dur, name, bucket))
+    for ts, dur, name, bucket in attention:
+        end = ts + dur
+        if windows and windows[-1]["bucket"] == bucket:
+            windows[-1]["end_us"] = max(windows[-1]["end_us"], end)
+            windows[-1]["attention_calls"] += 1
+        else:
+            side, phase = bucket.split("_", 1)
+            windows.append({
+                "bucket": bucket,
+                "side": side,
+                "phase": phase,
+                "start_us": ts,
+                "end_us": end,
+                "attention_calls": 1,
+            })
+    for index, window in enumerate(windows, 1):
+        window["index"] = index
+        center = window["start_us"] + (window["end_us"] - window["start_us"]) / 2.0
+        window["center_us"] = center
+    return windows
+
+
+def _classify_events_by_windows(evs, windows: list[dict]) -> dict[str, list[tuple[float, float, str]]]:
+    buckets = {
+        "main_prefill": [],
+        "main_generate": [],
+        "draft_prefill": [],
+        "draft_generate": [],
+    }
+    if not windows:
+        return buckets
+    centers = [w["center_us"] for w in windows]
+    boundaries = [(centers[i] + centers[i + 1]) / 2.0 for i in range(len(centers) - 1)]
+    for event in evs:
+        midpoint = event[0] + event[1] / 2.0
+        index = 0
+        while index < len(boundaries) and midpoint >= boundaries[index]:
+            index += 1
+        window = windows[index]
+        buckets[f"{window['side']}_{window['phase']}"] .append(event)
+    return buckets
+
+
+def _intervals_between_windows(windows: list[dict]) -> list[dict]:
+    intervals = []
+    for left, right in zip(windows, windows[1:]):
+        intervals.append({
+            "from": f"{left['side']}_{left['phase']}",
+            "to": f"{right['side']}_{right['phase']}",
+            "gap_ms": max(0.0, (right["start_us"] - left["end_us"]) / 1000.0),
+            "start_us": left["end_us"],
+            "end_us": right["start_us"],
+        })
+    return intervals
+
+
+def _summarize_intervals(intervals: list[dict]) -> list[dict]:
+    groups = defaultdict(list)
+    for interval in intervals:
+        groups[(interval["from"], interval["to"])].append(interval["gap_ms"])
+    rows = []
+    for (left, right), values in groups.items():
+        values.sort()
+        count = len(values)
+        rows.append({
+            "from": left,
+            "to": right,
+            "count": count,
+            "mean_gap_ms": sum(values) / count,
+            "p50_gap_ms": values[(count - 1) // 2],
+            "max_gap_ms": values[-1],
+        })
+    rows.sort(key=lambda row: (row["from"], row["to"]))
+    return rows
+
+
+def _generation_count(windows: list[dict]) -> int:
+    """One main-generate window == one decode step; this is the denominator for
+    per-generation kernel cost, not a raw event count."""
+    return sum(1 for w in windows if w["bucket"] == "main_generate")
+
+
+def _draft_span_ms(windows: list[dict]) -> float | None:
+    """Average draft-window duration, counted only for draft windows sandwiched between
+    two main-generate windows -- excludes the leftover draft activity right after prefill,
+    which is not a steady-state speculative iteration."""
+    spans = [(w["end_us"] - w["start_us"]) / 1000.0
+             for prev, w, nxt in zip(windows, windows[1:], windows[2:])
+             if w["bucket"] == "draft_generate"
+             and prev["bucket"] == "main_generate" and nxt["bucket"] == "main_generate"]
+    return sum(spans) / len(spans) if spans else None
+
+
+def analyze_speculative(trace: Path, spec: SpeculativePatternSpec, top: int = 10) -> dict:
+    """Count main/draft attention kernel calls and infer iteration counts from layer counts.
+
+    Classification is regex-based only, over whatever kernel names the pipeline actually
+    enqueues -- it never assumes a specific kernel implementation (CM or otherwise) is
+    present. A result is marked incomplete instead of silently assigning events to the wrong
+    model when a layer sequence is truncated or interleaved.
+
+    Iteration counting (the `patterns` entry) requires BOTH `main_regex` and `draft_regex`.
+    Without a name for a side, this falls back to splitting ALL hot-spot kernels into
+    main/draft by call-count divisibility against `main_layers`/`draft_layers` (see
+    `_classify_by_call_count`) -- no kernel name needed at all. That split degrades to a
+    single unsplit hot-spot table only when the layer counts themselves cannot distinguish
+    the two models (missing, zero, or equal).
+    """
+    raw = [e for e in _absolute(_load_events(trace)) if not MEM_RE.match(e[2])]
     if not raw:
         return {"trace": str(trace), "patterns": [], "warnings": ["no device events"]}
-    cm_re = re.compile(spec.cm_regex, re.I)
-    main_re = re.compile(spec.main_regex, re.I)
-    draft_re = re.compile(spec.draft_regex, re.I)
-    attention = [(ts, dur, name) for ts, dur, name in raw
-                 if cm_re.search(name) or main_re.search(name) or draft_re.search(name)]
-    anchors = [event for event in attention if cm_re.search(event[2])]
-    patterns = []
-    if anchors:
-        main = [event for event in attention if main_re.search(event[2])]
-        draft = [event for event in attention if draft_re.search(event[2])]
-        main_layers = spec.main_full_attention_layers or spec.main_layers
-        patterns.append({
-            "index": 1,
-            "cm_sdpa_vlen": len(anchors),
-            "main_attention": len(main),
-            "draft_attention": len(draft),
-            "main_sequences": len(main) / main_layers,
-            "draft_sequences": len(draft) / spec.draft_layers,
-            "complete": (len(main) % main_layers == 0 and
-                         len(draft) % spec.draft_layers == 0),
-            "start_us": anchors[0][0],
-            "end_us": attention[-1][0] + attention[-1][1],
-        })
-    warnings = []
-    if not anchors:
-        warnings.append(f"no dflash anchor matches /{spec.cm_regex}/")
-    if any(not pattern["complete"] for pattern in patterns):
-        warnings.append("one or more dflash patterns have incomplete layer sequences")
-    return {"trace": str(trace),
-            "main_layers": spec.main_full_attention_layers or spec.main_layers,
-            "draft_layers": spec.draft_layers, "patterns": patterns, "warnings": warnings}
+    main_re = re.compile(spec.main_regex, re.I) if spec.main_regex else None
+    draft_re = re.compile(spec.draft_regex, re.I) if spec.draft_regex else None
+    main = [event for event in raw if main_re and main_re.search(event[2])]
+    draft = [event for event in raw if draft_re and draft_re.search(event[2])]
+    main_layers = spec.main_full_attention_layers or spec.main_layers
+    draft_layers = spec.draft_layers
+    out = {"trace": str(trace), "main_layers": main_layers,
+           "draft_layers": draft_layers, "patterns": [], "warnings": []}
+
+    if main_re and draft_re:
+        phase_names = _speculative_phase_name_sets(_summarize(raw), main_layers, draft_layers)
+        windows = _attention_windows(raw, phase_names)
+        out["attention_windows"] = windows
+        classified = _classify_events_by_windows(raw, windows)
+        out["phase_hotspots"] = {name: _summarize(events)[:top] for name, events in classified.items()}
+        generation_count = _generation_count(windows)
+        out["generation_count"] = generation_count
+        out["draft_span_ms"] = _draft_span_ms(windows)
+        for bucket in ("main_generate", "draft_generate"):
+            if generation_count:
+                for row in out["phase_hotspots"].get(bucket, []):
+                    row["ms_per_generation"] = row["total_ms"] / generation_count
+        intervals = _intervals_between_windows(windows)
+        out["intervals"] = intervals
+        out["interval_summary"] = _summarize_intervals(intervals)
+        if main or draft:
+            attention = sorted(main + draft)
+            out["patterns"].append({
+                "index": 1,
+                "main_attention": len(main),
+                "draft_attention": len(draft),
+                "main_sequences": len(main) / main_layers if main_layers else 0.0,
+                "draft_sequences": len(draft) / draft_layers if draft_layers else 0.0,
+                "complete": (bool(main_layers) and len(main) % main_layers == 0 and
+                             bool(draft_layers) and len(draft) % draft_layers == 0),
+                "start_us": attention[0][0],
+                "end_us": attention[-1][0] + attention[-1][1],
+            })
+        else:
+            out["warnings"].append(f"no main (/{spec.main_regex}/) or draft "
+                                    f"(/{spec.draft_regex}/) attention kernel matched this trace")
+        if any(not p["complete"] for p in out["patterns"]):
+            out["warnings"].append("one or more speculative patterns have incomplete layer "
+                                    "sequences")
+        return out
+
+    # At least one regex is missing: the pool that regex would have claimed is "remaining".
+    remaining = [event for event in raw if not (main_re and main_re.search(event[2]))
+                 and not (draft_re and draft_re.search(event[2]))]
+    if spec.main_regex:
+        out["warnings"].append(f"main_regex configured (/{spec.main_regex}/) -- main side is "
+                                f"an exact count, not call-count classification")
+    if spec.draft_regex:
+        out["warnings"].append(f"draft_regex configured (/{spec.draft_regex}/) -- draft side "
+                                f"is an exact count, not call-count classification")
+
+    can_classify = (bool(main_layers) and bool(draft_layers) and main_layers != draft_layers)
+    if not can_classify:
+        out["hotspots"] = _summarize(remaining)[:top]
+        out["warnings"].append(
+            "cannot separate main vs draft by call count (main_layers/draft_layers missing, "
+            "zero, or equal) -- showing combined hot-spot kernels only")
+        return out
+
+    rows = _summarize(remaining)
+    main_rows, draft_rows, other_rows = _classify_by_call_count(rows, main_layers, draft_layers)
+    if not spec.main_regex:
+        out["main_hotspots"] = main_rows[:top]
+        out["warnings"].append(
+            f"no main_regex configured -- main hot-spots inferred from call counts divisible "
+            f"by main_layers={main_layers} only")
+    if not spec.draft_regex:
+        out["draft_hotspots"] = draft_rows[:top]
+        out["warnings"].append(
+            f"no draft_regex configured -- draft hot-spots inferred from call counts "
+            f"divisible by draft_layers={draft_layers} only")
+    if other_rows:
+        out["unclassified_hotspots"] = other_rows[:top]
+        out["warnings"].append(
+            f"{len(other_rows)} kernel(s) could not be assigned to either model by call "
+            f"count (divisible by both or neither layer count)")
+    return out
 
 
-def render_dflash(result: dict) -> str:
-    lines = [f"trace   {result['trace']}",
-             f"dflash  main_layers={result.get('main_layers', '?')} "
-             f"draft_layers={result.get('draft_layers', '?')}",
-             "pattern cm_sdpa_vlen main_attention draft_attention main_seq draft_seq status"]
-    for pattern in result.get("patterns", []):
-        status = "complete" if pattern["complete"] else "INCOMPLETE"
-        lines.append(f"{pattern['index']:>7} {pattern['cm_sdpa_vlen']:>13} "
-                     f"{pattern['main_attention']:>15} {pattern['draft_attention']:>15} "
-                     f"{pattern['main_sequences']:>9.2f} {pattern['draft_sequences']:>10.2f} "
-                     f"{status}")
+def _render_hotspot_table(title: str, rows: list[dict]) -> list[str]:
+    per_generation = bool(rows) and "ms_per_generation" in rows[0]
+    header = "  kernel  calls  total_ms  mean_us  p50_us  p90_us"
+    if per_generation:
+        header += "  ms_per_gen"
+    lines = [title, header]
+    for r in rows:
+        line = (f"  {r['kernel'][:60]:<60} {r['calls']:>6} {r['total_ms']:>9.2f} "
+                f"{r['mean_us']:>8.2f} {r['p50_us']:>7.2f} {r['p90_us']:>7.2f}")
+        if per_generation:
+            line += f" {r['ms_per_generation']:>10.3f}"
+        lines.append(line)
+    return lines
+
+
+def render_speculative(result: dict) -> str:
+    lines = [f"trace       {result['trace']}",
+             f"speculative main_layers={result.get('main_layers', '?')} "
+             f"draft_layers={result.get('draft_layers', '?')}"]
+    if result.get("patterns"):
+        lines.append("pattern main_attention draft_attention main_seq draft_seq status")
+        for pattern in result["patterns"]:
+            status = "complete" if pattern["complete"] else "INCOMPLETE"
+            lines.append(f"{pattern['index']:>7} "
+                         f"{pattern['main_attention']:>15} {pattern['draft_attention']:>15} "
+                         f"{pattern['main_sequences']:>9.2f} {pattern['draft_sequences']:>10.2f} "
+                         f"{status}")
+    if result.get("attention_windows"):
+        lines.append("execution windows side phase attention_calls span_ms")
+        for window in result["attention_windows"]:
+            span_ms = (window["end_us"] - window["start_us"]) / 1000.0
+            lines.append(f"{window['index']:>7} {window['side']:<5} {window['phase']:<8} "
+                         f"{window['attention_calls']:>15} {span_ms:>7.2f}")
+    if "generation_count" in result:
+        lines.append(f"generations   {result['generation_count']}")
+    if result.get("draft_span_ms") is not None:
+        lines.append(f"draft span    {result['draft_span_ms']:.2f} ms "
+                     f"(avg draft time between two main generations)")
+    if result.get("phase_hotspots"):
+        for bucket in ("main_prefill", "main_generate", "draft_prefill", "draft_generate"):
+            rows = result["phase_hotspots"].get(bucket, [])
+            title = bucket.replace("_", " ") + " hot-spot kernels"
+            lines += _render_hotspot_table(title, rows)
+    if result.get("interval_summary"):
+        lines.append("intervals between adjacent main/draft windows")
+        lines.append("  from          to            count  mean_gap_ms  p50_gap_ms  max_gap_ms")
+        for row in result["interval_summary"]:
+            lines.append(f"  {row['from']:<13}{row['to']:<13}{row['count']:>5}"
+                         f"{row['mean_gap_ms']:>13.2f}{row['p50_gap_ms']:>12.2f}"
+                         f"{row['max_gap_ms']:>12.2f}")
+    if "hotspots" in result:
+        lines += _render_hotspot_table("hot-spot kernels (no main/draft split)",
+                                       result["hotspots"])
+    if "main_hotspots" in result:
+        lines += _render_hotspot_table("main hot-spot kernels", result["main_hotspots"])
+    if "draft_hotspots" in result:
+        lines += _render_hotspot_table("draft hot-spot kernels", result["draft_hotspots"])
+    if "unclassified_hotspots" in result:
+        lines += _render_hotspot_table("unclassified hot-spot kernels (neither model, "
+                                       "by call count)", result["unclassified_hotspots"])
     for warning in result.get("warnings", []):
         lines.append(f"WARNING: {warning}")
     return "\n".join(lines)
@@ -370,12 +770,17 @@ def analyze(trace: Path, kernel: str = "", seg: Segmentation | None = None) -> d
         "global": {"rows": _summarize(evs), "span_ms": _span_ms(evs)},
         "segmentation": {"anchor": seg.split_kernel, "gap_ms": seg.gap_ms,
                          "cycles": len(windows), "dropped_cycles": seg.drop_cycles,
+                         "first_event_us": evs[0][0] if evs else None,
+                         "first_body_us": body[0][0] if body else None,
                          "prologue_events": len(prologue),
                          "prologue_ms": sum(d for _, d, _ in prologue) / 1000.0,
                          "mem_ops": len(mem), "mem_ms": sum(d for _, d, _ in mem) / 1000.0},
         "phases": {},
         "warnings": [],
     }
+    out["segmentation"]["windows"] = [
+        {"start_us": lo, "end_us": hi, "label": "generate"} for lo, hi in windows
+    ]
     for name, evl in (("prefill", pre), ("generate", gen)):
         rows = _summarize(evl)
         total = sum(r["total_ms"] for r in rows)
@@ -439,6 +844,128 @@ def _read_metrics(path: Path) -> dict[str, str]:
         return {}
     return dict(l.split("=", 1) for l in path.read_text(errors="ignore").splitlines()
                 if "=" in l)
+
+
+def _fmt_timeline_time(offset_us: float) -> str:
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    stamp = base + timedelta(microseconds=offset_us)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+
+
+def _timeline_mermaid(result: dict) -> str:
+    lines = [
+        "gantt",
+        f"title {Path(result['trace']).parent.name} runtime timeline",
+        "dateFormat YYYY-MM-DDTHH:mm:ss.SSS",
+        "axisFormat %H:%M:%S.%L",
+    ]
+    if result.get("attention_windows"):
+        lines.append("section speculative")
+        for window in result["attention_windows"]:
+            start = _fmt_timeline_time(window["start_us"])
+            end = _fmt_timeline_time(window["end_us"])
+            label = f"{window['side']} {window['phase']} #{window['index']}"
+            lines.append(f"{label} : {start}, {end}")
+        return "\n".join(lines) + "\n"
+
+    seg = result.get("segmentation", {})
+    windows = seg.get("windows", [])
+    if windows:
+        if seg.get("prologue_events") and seg.get("first_event_us") is not None and seg.get("first_body_us") is not None:
+            lines.append("section prologue")
+            lines.append(
+                f"model load / compile : {_fmt_timeline_time(seg['first_event_us'])}, {_fmt_timeline_time(seg['first_body_us'])}"
+            )
+        if seg.get("first_body_us") is not None and windows[0]["start_us"] > seg["first_body_us"]:
+            lines.append("section prefill")
+            lines.append(
+                f"prefill : {_fmt_timeline_time(seg['first_body_us'])}, {_fmt_timeline_time(windows[0]['start_us'])}"
+            )
+        lines.append("section generate")
+        for index, window in enumerate(windows, 1):
+            lines.append(
+                f"generate #{index} : {_fmt_timeline_time(window['start_us'])}, {_fmt_timeline_time(window['end_us'])}"
+            )
+        return "\n".join(lines) + "\n"
+
+    lines.append("section global")
+    lines.append("global summary only : milestone, 2025-01-01T00:00:00.000, 0ms")
+    return "\n".join(lines) + "\n"
+
+
+def write_report_artifacts(trace: Path, result: dict, rendered: str) -> dict[str, str]:
+    summary = trace.parent / "profile_summary.json"
+    report = trace.parent / "profile_report.txt"
+    timeline = trace.parent / "profile_timeline.mmd"
+    summary.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    report.write_text(rendered + "\n", encoding="utf-8")
+    timeline.write_text(_timeline_mermaid(result), encoding="utf-8")
+    return {
+        "summary": str(summary),
+        "report": str(report),
+        "timeline": str(timeline),
+    }
+
+
+def load_profile_summary(path: Path) -> dict:
+    """Load one saved profile summary from a summary file or a profile output directory."""
+    target = path
+    if path.is_dir():
+        direct = path / "profile_summary.json"
+        if direct.exists():
+            target = direct
+        else:
+            hits = sorted(path.rglob("profile_summary.json"))
+            if not hits:
+                raise FileNotFoundError(f"no profile_summary.json under {path}")
+            target = hits[0]
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def pick_hot_kernel(summary: dict, pick: int = 1, bucket: str = "") -> dict:
+    """Pick one kernel row from a saved profile summary.
+
+    Default priority follows the usual optimization path: steady-state generate before global
+    totals, and main-generate before draft on speculative reports.
+    """
+    if pick < 1:
+        raise ValueError("pick must be >= 1")
+
+    candidates: list[tuple[str, list[dict]]] = []
+    if bucket:
+        if bucket in {"main_prefill", "main_generate", "draft_prefill", "draft_generate"}:
+            rows = summary.get("phase_hotspots", {}).get(bucket, [])
+            candidates.append((bucket, rows))
+        elif bucket in {"prefill", "generate"}:
+            rows = summary.get("phases", {}).get(bucket, {}).get("rows", [])
+            candidates.append((bucket, rows))
+        elif bucket in {"global", "hotspots", "main_hotspots", "draft_hotspots",
+                        "unclassified_hotspots"}:
+            if bucket == "global":
+                rows = summary.get("global", {}).get("rows", [])
+            else:
+                rows = summary.get(bucket, [])
+            candidates.append((bucket, rows))
+        else:
+            raise ValueError(f"unknown bucket '{bucket}'")
+    else:
+        ordered = [
+            ("main_generate", summary.get("phase_hotspots", {}).get("main_generate", [])),
+            ("generate", summary.get("phases", {}).get("generate", {}).get("rows", [])),
+            ("main_hotspots", summary.get("main_hotspots", [])),
+            ("hotspots", summary.get("hotspots", [])),
+            ("global", summary.get("global", {}).get("rows", [])),
+        ]
+        candidates.extend((name, rows) for name, rows in ordered if rows)
+
+    for source_bucket, rows in candidates:
+        if len(rows) >= pick:
+            row = dict(rows[pick - 1])
+            row["bucket"] = source_bucket
+            return row
+
+    available = {name: len(rows) for name, rows in candidates}
+    raise ValueError(f"pick={pick} exceeds available rows: {available or {'none': 0}}")
 
 
 # -- render ----------------------------------------------------------------------------

@@ -14,4 +14,4 @@ data because a generator wasn't cached deterministically, (3) a mask chosen to "
 effect that the causal structure already implied regardless of the change. `ckh equiv`'s
 `non_vacuous` field on `KernelSpec.reference` exists specifically so this check happens every
 time, not only when someone remembers to ask "but would this test have caught anything?" --
-see `.claude/agents/equivalence-prover.md` and `.claude/agents/kernel-onboarder.md`.
+see `.github/agents/ckh-equivalence-prover.agent.md` and `.github/agents/ckh-kernel-onboarder.agent.md`.

@@ -5,10 +5,44 @@ Kernels stay in their own repos; this repo holds the **method**, the **tooling**
 **findings**.
 
 → **Optimizing a kernel?** — [Quickstart](#quickstart) gets you measuring in a few minutes.
-→ **Onboarding a kernel you did not write?** — [`docs/ONBOARDING.md`](docs/ONBOARDING.md) is
+→ **Onboarding a kernel you did not write?** — [`docs/KERNEL_ONBOARDING.md`](docs/KERNEL_ONBOARDING.md) is
 the step-by-step path, including which steps have tool support today and which are manual.
+→ **Understanding the workflow?** — [`docs/OVERVIEW.md`](docs/OVERVIEW.md)
+explains the method, while [`docs/WORKFLOW.md`](docs/WORKFLOW.md)
+shows the flow and artifacts.
 → **Connecting GitHub Copilot?** — [`kernel-harness-mcp-setup`](.github/skills/kernel-harness-mcp-setup/SKILL.md)
 explains the local `ckh` MCP setup and the interpreter/path checks that prevent common failures.
+
+## New User Quickstart
+
+If you are new to this repo and want to use the harness from VS Code:
+
+1. Clone the repo and open it in VS Code.
+2. Run the local MCP bootstrap:
+
+  ```bash
+  python deploy/setup_local_mcp.py
+  ```
+
+3. Edit `platform.toml` so the machine-specific repo paths and environment settings are correct.
+4. Reload VS Code and approve the MCP trust prompt if it appears.
+5. Select **CKH Kernel Harness** from the chat agent picker.
+6. Start with `ckh doctor`, or paste a full pipeline command and ask the harness to profile and optimize it.
+
+Prefer this local stdio path first. The remote HTTP deployment lane exists, but is still under
+development.
+
+## GitHub Copilot: unattended pipeline optimization
+
+In VS Code, select **CKH Kernel Harness** from the agent picker and send the complete pipeline
+command with a request to profile and optimize it. The coordinator starts immediately and
+runs doctor → profile preflight → repeated collection → report → gated kernel optimization →
+integration without asking for command arguments already present in the message.
+
+Each stage is a separate `.github/agents/ckh-*.agent.md` delegate with its own `model:` field.
+Change that field to assign a different model to a stage; model names must match the VS Code
+model picker. Deterministic measurements still come from `ckh` MCP tools, regardless of which
+model interprets or sequences them.
 
 ## How it Works
 
@@ -117,8 +151,9 @@ in one interleaved batch. A single candidate measured with `ckh round` never nee
 
 The **knowledge base** (`kb/`) carries the expertise the loop consults: correctness
 constraints, memory-access and fusion patterns, XPU/Xe-specific tuning, and harness-design
-patterns, split by concern (`kb/README.md`). The **method** lives in `.claude/`: eleven roles
-in `.claude/agents/` and the flow with its gates in `.claude/skills/cm-kernel-opt/WORKFLOW.md`.
+patterns, split by concern (`kb/README.md`). The **method** lives in `.github/agents/` for
+runtime roles, `docs/` for the human-readable playbook, and `workflows/` for
+the declarative role graph.
 
 Each candidate change runs the same circuit — classify it as bit-exact or not, implement,
 prove equivalence non-vacuously, measure interleaved, then record the verdict *with its
@@ -131,9 +166,8 @@ so a rejected idea is never re-tried blind.
 cp platform.example.toml platform.toml   # the only machine-specific file
 $EDITOR platform.toml                    # point it at your kernel repos
 pip install -e .
-pip install -e /path/to/aboutSHW/opencl        # required when exec.clops_path is empty
 
-ckh doctor                               # validate env, check clops resolves, check for competing GPU work
+ckh doctor                               # validate paths and check for competing GPU work
 ckh ledger pa_small_q --only rejected    # READ THIS FIRST -- what is already settled
 ckh profile setup                        # e2e first: is this kernel even worth optimizing?
 ckh kernelgen cm_pa_small_q              # optional: plugin kernel -> sandbox + scaffolding
@@ -146,11 +180,14 @@ ckh equiv pa_small_q --axis q_len=6      # check the kernel against its declared
 
 ## Use with GitHub Copilot
 
-After `pip install -e .`, open the repository root in VS Code. The tracked `.mcp.json` and
-`.vscode/mcp.json` start the local `ckh` MCP server through `deploy/ckh-mcp-vscode`, which avoids
-depending on the editor process inheriting the same `PATH` as an interactive shell. Approve the MCP
-trust prompt, then reload the window if the server is not started automatically. Select **CKH Kernel
-Harness** from the Chat agent picker to use the guarded measurement workflow.
+Run `python deploy/setup_local_mcp.py` once. It auto-detects the platform, creates `.venv`,
+installs the repo, seeds `platform.toml` if needed, writes the local MCP config, and proves
+the MCP handshake. Platform-native wrappers also exist at `deploy/setup_local_mcp.sh` and
+`deploy/setup_local_mcp.ps1`.
+
+After it finishes, open or reload the repository root in VS Code, approve the MCP trust
+prompt if needed, and select **CKH Kernel Harness** from the Chat agent picker to use the
+guarded measurement workflow.
 
 If the `ckh` tools do not appear, confirm the VS Code workspace folder is this repository root, then
 run **MCP: List Servers** and start or enable `ckh`. See
@@ -377,7 +414,7 @@ whether the source actually mentions the name, reproduced `pa_small_q`'s hand-wr
 The first generated artifact is a sandbox pytest whose first case is real work: **does the
 port compile at all?** That is where ports actually fail — a header that did not come along,
 a macro nobody wrote down — and it is answerable without knowing a single input value.
-`.claude/agents/kernel-onboarder.md` picks up from there for dispatch, inputs, args and the
+`.github/agents/ckh-kernel-onboarder.agent.md` picks up from there for dispatch, inputs, args and the
 reference.
 
 ## Driving it from Copilot (MCP)
@@ -385,6 +422,9 @@ reference.
 The same commands are exposed as MCP tools, so a model can run the loop instead of a human
 relaying CLI output into a chat. The server must live **on the box with the GPU** — every
 tool compiles and runs a CM kernel — so there are two lanes:
+
+The remote HTTP lane is still under development. Prefer the local stdio lane unless you need
+to drive a separate Linux GPU box.
 
 ```bash
 cp .env.example .env
@@ -398,9 +438,9 @@ source of truth (`.env`). Tools: `doctor`, `list_kernels`, `bench`, `equiv`, `sn
 security posture (the port is a remote-execution primitive, so the remote lane refuses to
 deploy without `MCP_AUTH_TOKEN`) are in [deploy/README.md](deploy/README.md).
 
-`ckh profile run` is deliberately **not** an MCP tool: it executes an arbitrary user-supplied
-pipeline command, which over a socket would be a second remote-execution primitive. Collection
-stays on the CLI; the model gets detection and analysis.
+`ckh profile run` is exposed only to the local stdio MCP server by default. Because it executes
+an arbitrary user-supplied pipeline command, the HTTP path requires explicit opt-in via
+`CKH_MCP_ALLOW_PROFILE_RUN=1`.
 
 `ckh kernelgen` is not one either, for a different reason: it writes into two repos and its
 whole value is the human confirming *which* kernel before anything is copied. It is a CLI
@@ -419,13 +459,9 @@ Distilled from an optimization pass on `pa_small_q` where roughly half the effor
 wrong hypotheses, self-inflicted regressions and tests that silently proved nothing. Three
 design goals follow directly:
 
-**Not tied to one sandbox repo.** Every measurement ultimately calls `clops` to compile/run a
-CM kernel; that used to only resolve because it happened to live inside the reference
-sandbox (aboutSHW). `exec.clops_path` in `platform.toml` now points at wherever your own
-`clops`-providing checkout is, independently of `repos.sandbox` (the kernel *source* you're
-optimizing) -- or leave it unset and `pip install -e <path>/opencl` once, outside this
-config, if you'd rather have a normal installed `clops`. `ckh doctor` reports which one
-actually resolved and fails loudly if neither does.
+**Not tied to one sandbox repo.** Kernel sources and machine-specific paths are configured
+independently, so the harness can run its static, reference, and orchestration workflows
+without a sandbox-specific Python package being configured in `platform.toml`.
 
 **Reusable across kernels.** Everything kernel-specific lives in one descriptor
 (`kernels/<name>.py`): signature, jit defines, shape axes, dispatch, input generation, and
@@ -433,7 +469,7 @@ now a `reference` — either a `TorchReference` (independent Python/torch ground
 `KernelReference` (another compiled kernel as baseline). `bench` and `equiv` are generic over
 it; `ablate` / `sweep` still need to be. Adopting a new kernel means writing a descriptor, not
 another one-off script — the previous approach re-derived the same facts by grepping a
-1100-line source about fifteen times. See `.claude/agents/kernel-onboarder.md`.
+1100-line source about fifteen times. See `.github/agents/ckh-kernel-onboarder.agent.md`.
 
 **Token-efficient.** Verbose output stays in the measurement environment. `runner.py` emits
 exactly one machine-readable line; the CLI prints a table. Machine facts live in
@@ -530,10 +566,11 @@ way `equiv` now is.
 
 ## The eleven roles
 
-`.claude/agents/` — `pre-profiler`, `rig-warden`, `roofline-analyst`, `algorithm-critic`,
-`budget-prober`, `bitexact-classifier`, `equivalence-prover`, `range-tuner`, `integrator`,
-`kernel-onboarder`, `reference-generator`. Flow and gates in
-`.claude/skills/cm-kernel-opt/WORKFLOW.md`. Each one
+`.github/agents/` — `ckh-pre-profiler`, `ckh-doctor`, `ckh-roofline-analyst`,
+`ckh-algorithm-critic`, `ckh-budget-prober`, `ckh-bitexact-classifier`,
+`ckh-equivalence-prover`, `ckh-range-tuner`, `ckh-integrator`,
+`ckh-kernel-onboarder`, `ckh-reference-generator`. Flow and gates in
+`workflows/performance-optimization.workflow.yaml`. Each one
 exists because of a specific failure (or, for the last two, a specific missing capability);
 the agent files name it. `ckh gen-reference <name>` (a plain script, not an agent) turns a
 plain PyTorch `Model` (`kernels/pending/<name>_pytorch.py`) into the reference half of a

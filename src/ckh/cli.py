@@ -12,7 +12,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from . import bench, equiv, ledger, results
+from . import bench, clintercept, equiv, ledger, results
 from .platform import REPO_ROOT, Platform
 
 
@@ -36,10 +36,6 @@ def cmd_doctor(a) -> int:
     print(f"noise floor    {plat.noise_floor_pct}%   rounds {plat.rounds}")
 
     ok = True
-    clops_ok, clops_msg = plat.check_clops()
-    print(clops_msg)
-    ok = ok and clops_ok
-
     busy = plat.competing_gpu_work()
     if busy:
         print("\ncompeting GPU work -- measurements will be junk until this stops:")
@@ -117,7 +113,7 @@ def cmd_gen_reference(a) -> int:
     except gen_reference.Refused as e:
         print(f"refusing to guess: {e}")
         print("this case needs judgment a script shouldn't -- use the reference-generator "
-             "agent instead (.claude/agents/reference-generator.md)")
+              "agent instead (.github/agents/ckh-reference-generator.agent.md)")
         return 2
     print(f"wrote {out_path}")
     return 0
@@ -129,7 +125,7 @@ def _pick_candidate(hits: list, needle: str, no_prompt: bool):
     if len(hits) == 1:
         return hits[0]
     if not hits:
-        print(f"no .cm under the plugin's impls/cm matches '{needle}'. "
+        print(f"no kernel source under the known plugin trees matches '{needle}'. "
               f"Pass --source <path> if you already know the file.")
         return None
     print(f"'{needle}' matches {len(hits)} kernels:")
@@ -145,6 +141,49 @@ def _pick_candidate(hits: list, needle: str, no_prompt: bool):
     return hits[int(choice) - 1] if choice.isdigit() and 1 <= int(choice) <= len(hits) else None
 
 
+def _resolve_kernelgen_source(plat, kernelgen, kernel: str, explicit: str | None,
+                              dump_sources: str | None, profile_dump_dir: str | None,
+                              no_prompt: bool):
+    if explicit:
+        src_path = Path(explicit)
+        if not src_path.exists():
+            print(f"{src_path} not found")
+            return None
+        return src_path
+
+    dump_root = None
+    if profile_dump_dir:
+        dump_root = kernelgen.dump_sources_from_profile_dir(Path(profile_dump_dir))
+    if dump_root is None:
+        last_profile = results.last_profile()
+        if last_profile and last_profile.get("out_dir"):
+            dump_root = kernelgen.dump_sources_from_profile_dir(Path(last_profile["out_dir"]))
+    if dump_root is None:
+        dump_root = kernelgen.configured_dump_sources(plat.raw, dump_sources)
+    if dump_root:
+        hits = kernelgen.dump_candidates(dump_root, kernel)
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            picked = _pick_candidate(hits, kernel, no_prompt)
+            if picked is not None:
+                return picked
+            print(f"ambiguous dumped sources under {dump_root} -- pass --source or --dump-sources")
+            return None
+
+    hits = kernelgen.candidates(plat.production, kernel)
+    return _pick_candidate(hits, kernel, no_prompt)
+
+
+def _profile_prepare_out_dir(a) -> Path | None:
+    if getattr(a, "dump_dir", ""):
+        return Path(a.dump_dir)
+    last_profile = results.last_profile()
+    if last_profile and last_profile.get("out_dir"):
+        return Path(last_profile["out_dir"])
+    return None
+
+
 def cmd_kernelgen(a) -> int:
     """Port a plugin kernel into the sandbox. OPTIONAL -- skip it if you already have one.
 
@@ -156,22 +195,17 @@ def cmd_kernelgen(a) -> int:
     from . import kernelgen
     plat = Platform.load()
     try:
-        if a.source:
-            src_path = Path(a.source)
-            if not src_path.exists():
-                print(f"{src_path} not found")
-                return 1
-        else:
-            hits = kernelgen.candidates(plat.production, a.kernel)
-            src_path = _pick_candidate(hits, a.kernel, a.yes or a.no_prompt)
-            if src_path is None:
-                return 1
+        src_path = _resolve_kernelgen_source(
+            plat, kernelgen, a.kernel, a.source, a.dump_sources, a.profile_dump_dir,
+            a.yes or a.no_prompt
+        )
+        if src_path is None:
+            return 1
 
-        cmd = kernelgen.cm_dir(plat.production)
-        src = kernelgen.parse_cm(src_path, [cmd, cmd / "include"])
+        src = kernelgen.parse_source(src_path, kernelgen.include_dirs_for(src_path, plat.production))
         src.resolve_entry(a.kernel)
         generator = a.generator or kernelgen.guess_generator(src_path.stem)
-        hints = kernelgen.scrape_host(cmd, generator)
+        hints = kernelgen.scrape_host(plat.production, generator)
         name = a.name or src_path.stem
         dest = a.dest or plat.kernelgen_dest
 
@@ -183,7 +217,7 @@ def cmd_kernelgen(a) -> int:
         host_line = (f"{hints.file.name}::{generator}" if hints.found
                      else f"no match for {generator} -- pass --generator")
         print(f"host       {host_line}")
-        print(f"-> sandbox {plat.sandbox / dest / (name + '.cm')}")
+        print(f"-> sandbox {plat.sandbox / dest / (name + src_path.suffix)}")
         print(f"-> spec    kernels/{name}.py")
 
         if not a.yes:
@@ -194,19 +228,34 @@ def cmd_kernelgen(a) -> int:
                 print("aborted, nothing written")
                 return 1
 
-        manifest = kernelgen.port(plat.sandbox, dest, src, name, overwrite=a.overwrite)
-        spec = kernelgen.emit_spec(REPO_ROOT, name, dest, src, hints, manifest)
-        test = kernelgen.emit_test(plat.sandbox, dest, name, src, hints)
+        focus_axes = {}
+        for kv in a.axis or []:
+            key, _, value = kv.partition("=")
+            focus_axes[key] = value
+        generated = kernelgen.prepare(
+            REPO_ROOT,
+            plat.sandbox,
+            dest,
+            src,
+            name,
+            hints,
+            overwrite=a.overwrite,
+            focus_axes=focus_axes,
+        )
     except kernelgen.Refused as e:
         print(f"refusing: {e}")
         return 2
 
-    print(f"\nwrote {manifest['sandbox_kernel']}")
-    print(f"wrote {test}")
-    print(f"wrote {spec}")
-    print(f"\nnext: fill JIT in {test.name} and run `pytest -q {test.name}` in the sandbox -- "
+    print(f"\nwrote {generated['sandbox_kernel']}")
+    print(f"wrote {generated['wrapper']}")
+    print(f"wrote {generated['compile_test']}")
+    print(f"wrote {generated['correctness_test']}")
+    print(f"wrote {generated['perf_test']}")
+    print(f"wrote {generated['spec']}")
+    compile_name = Path(generated['compile_test']).name
+    print(f"\nnext: fill JIT in {compile_name} and run `pytest -q {compile_name}` in the sandbox -- "
           f"a compile is the first thing a port can actually fail at.\n"
-          f"then: .claude/agents/kernel-onboarder.md for dispatch/inputs/args/reference.")
+          f"then: .github/agents/ckh-kernel-onboarder.agent.md for dispatch/inputs/args/reference.")
     return 0
 
 
@@ -307,9 +356,55 @@ def cmd_profile(a) -> int:
     from . import clintercept as cli_layer
     plat = Platform.load()
     cfg = plat.raw.get("profile", {})
-    prefix = a.prefix or cfg.get("install_prefix") or str(REPO_ROOT / "third_party")
 
-    tool = cli_layer.locate(prefix, a.cli or cfg.get("cliloader"))
+    if a.action == "model":
+        try:
+            path = cli_layer.model_for_stage(
+                a.stage, cfg.get("models", {}), cfg.get("stage_models", {}))
+        except (KeyError, ValueError) as e:
+            print(f"model config error: {e}")
+            return 1
+        print(path)
+        return 0
+
+    if a.action == "detect":
+        # argv-only inspection: no cliloader needed, nothing runs.
+        command = a.command[1:] if a.command and a.command[0] == "--" else a.command
+        if not command:
+            command = cfg.get("pipeline") or []
+        if not command:
+            print("no pipeline command. Put it after `--`, or set [profile].pipeline in "
+                  "platform.toml.")
+            return 1
+        result = cli_layer.infer_speculative_pipeline(command)
+        print(f"is_speculative={result['is_speculative']}  confidence={result['confidence']}")
+        print(f"reason: {result['reason']}")
+        for c in result["candidates"]:
+            line = f"  {c['role']:<6} dir={c['dir']}"
+            if c["config"]:
+                line += f"  config={c['config']}"
+            elif c["config_candidates"]:
+                line += f"  AMBIGUOUS candidates={c['config_candidates']}"
+            else:
+                line += "  config=NOT FOUND"
+            print(line)
+        for w in result["warnings"]:
+            print(f"WARNING: {w}")
+        if (result["is_speculative"] and result["confidence"] == "high"
+                and all(c["config"] for c in result["candidates"])):
+            main_cfg = result["candidates"][0]["config"]
+            draft_cfg = result["candidates"][1]["config"]
+            print(f"\nnext: ckh profile report --speculative "
+                  f"--speculative-main-config \"{main_cfg}\" "
+                  f"--speculative-draft-config \"{draft_cfg}\" --dump-dir <dir>")
+            return 0
+        print("\nnot confident enough to auto-fill main/draft config -- confirm manually "
+              "before using --speculative-main-config/--speculative-draft-config")
+        return 1 if not result["is_speculative"] else 0
+
+    prefix = getattr(a, "prefix", None) or cfg.get("install_prefix") or str(REPO_ROOT / "third_party")
+
+    tool = cli_layer.locate(prefix, getattr(a, "cli", None) or cfg.get("cliloader"))
     if a.action == "setup":
         if tool is None:
             if not a.install:
@@ -347,13 +442,58 @@ def cmd_profile(a) -> int:
                   "platform.toml for unattended runs.")
             return 1
         print(f"pipeline from {source}: {shlex.join(command)}")
-        runs = cli_layer.run(tool, Path(a.out_dir), a.label, command, repeat=a.repeat,
-                             env=cfg.get("pipeline_env") or None)
+        runs = cli_layer.run(
+            tool,
+            Path(a.out_dir),
+            a.label,
+            command,
+            repeat=a.repeat,
+            env=cfg.get("pipeline_env") or None,
+            dump_sources=a.dump_sources,
+        )
         for r in runs:
             print(f"{r['tag']:<16} exit={r['exit_code']}  trace="
                   f"{'yes' if r['trace_present'] else 'MISSING'}  {r['app_metrics']}")
+        dump_sources_path = runs[0].get("dump_sources") if runs else None
+        if dump_sources_path:
+            results.record_last_profile(str(Path(a.out_dir)), dump_sources_path, runs)
+            print(f"dump sources {dump_sources_path}")
         print(f"\nnext: ckh profile report --dump-dir {a.out_dir} --kernel <name>")
+        if dump_sources_path:
+            print(f"then: ckh kernelgen <runtime-kernel>")
         return 0 if all(r["exit_code"] == 0 and r["trace_present"] for r in runs) else 1
+
+    if a.action == "prepare":
+        from . import kernelgen
+        out_dir = _profile_prepare_out_dir(a)
+        if out_dir is None:
+            print("no profile output available. Pass --dump-dir, or run `ckh profile run` first.")
+            return 1
+        summary_path = Path(a.summary) if a.summary else out_dir
+        try:
+            summary = cli_layer.load_profile_summary(summary_path)
+            selected = cli_layer.pick_hot_kernel(summary, pick=a.pick, bucket=a.bucket)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
+            print(f"profile prepare error: {e}")
+            return 1
+
+        runtime_kernel = kernelgen.runtime_symbol(selected["kernel"])
+        print(f"selected   {runtime_kernel}  (bucket {selected['bucket']}, rank {a.pick})")
+
+        ns = argparse.Namespace(
+            kernel=runtime_kernel,
+            source=None,
+            name=a.name,
+            dest=a.dest,
+            generator=a.generator,
+            dump_sources=None,
+            profile_dump_dir=str(out_dir),
+            axis=a.axis,
+            overwrite=a.overwrite,
+            yes=True,
+            no_prompt=True,
+        )
+        return cmd_kernelgen(ns)
 
     seg = cli_layer.Segmentation(gap_ms=a.gap_ms, drop_cycles=a.drop_cycles)
     if a.anchor:
@@ -364,34 +504,38 @@ def cmd_profile(a) -> int:
         return 1
     shares = []
     for t in traces:
-        if a.dflash:
-            cfg_dflash = cfg.get("dflash", {})
-            main_config = a.dflash_main_config or cfg_dflash.get("main_config")
-            draft_config = a.dflash_draft_config or cfg_dflash.get("draft_config")
+        if a.speculative:
+            cfg_speculative = cfg.get("speculative", {})
+            main_config = a.speculative_main_config or cfg_speculative.get("main_config")
+            draft_config = a.speculative_draft_config or cfg_speculative.get("draft_config")
             if not main_config or not draft_config:
-                print("dflash requires --dflash-main-config and --dflash-draft-config, "
-                      "or [profile.dflash] config paths in platform.toml")
+                print("speculative requires --speculative-main-config and "
+                      "--speculative-draft-config, or [profile.speculative] config paths in "
+                      "platform.toml")
                 return 1
             try:
-                spec = cli_layer.DFlashPatternSpec(
+                spec = cli_layer.SpeculativePatternSpec(
                     main_layers=cli_layer.load_num_hidden_layers(Path(main_config)),
                     draft_layers=cli_layer.load_num_hidden_layers(Path(draft_config)),
                     main_full_attention_layers=cli_layer.load_full_attention_layers(
                         Path(main_config)),
-                    cm_regex=cfg_dflash.get("cm_regex", r"cm_sdpa_vlen"),
-                    main_regex=cfg_dflash.get(
-                        "main_regex", r"sdpa_micro__generate|paged_attention_opt"),
-                    draft_regex=cfg_dflash.get("draft_regex", r"sdpa_micro__prefill"),
-                    gap_ms=float(cfg_dflash.get("gap_ms", 50.0)))
-                res = cli_layer.analyze_dflash(t, spec)
+                    main_regex=cfg_speculative.get(
+                        "main_regex", r"sdpa_micro__generate|paged_attention_opt|cm_sdpa_vlen"),
+                    draft_regex=cfg_speculative.get("draft_regex", r"sdpa_micro__prefill"),
+                    gap_ms=float(cfg_speculative.get("gap_ms", 50.0)))
+                res = cli_layer.analyze_speculative(t, spec, top=a.top)
             except (OSError, ValueError, json.JSONDecodeError) as e:
-                print(f"dflash config error: {e}")
+                print(f"speculative config error: {e}")
                 return 1
-            print(cli_layer.render_dflash(res))
+            rendered = cli_layer.render_speculative(res)
+            cli_layer.write_report_artifacts(t, res, rendered)
+            print(rendered)
             print()
             continue
         res = cli_layer.analyze(t, a.kernel, seg)
-        print(cli_layer.render(res, a.top))
+        rendered = cli_layer.render(res, a.top)
+        cli_layer.write_report_artifacts(t, res, rendered)
+        print(rendered)
         print()
         k = res.get("kernel")
         if k and k.get("matched"):
@@ -618,7 +762,7 @@ def cmd_ledger(a) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="ckh", description="CM kernel optimization harness")
+    ap = argparse.ArgumentParser(prog="ckh", description="OpenCL kernel optimization harness")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="validate the environment before measuring").set_defaults(fn=cmd_doctor)
@@ -655,14 +799,20 @@ def main() -> int:
     eq.set_defaults(fn=cmd_equiv)
 
     kg = sub.add_parser("kernelgen",
-                        help="OPTIONAL: port a plugin kernel into the sandbox + scaffold "
+                        help="OPTIONAL: port a plugin kernel source into the sandbox + scaffold "
                              "its spec and a compile test")
     kg.add_argument("kernel", help="profiled kernel name, e.g. cm_pa_small_q")
-    kg.add_argument("--source", help="skip the search: the .cm to port, by path")
-    kg.add_argument("--name", help="sandbox kernel/spec name (default: the .cm's stem)")
+    kg.add_argument("--source", help="skip the search: the kernel source to port, by path")
+    kg.add_argument("--name", help="sandbox kernel/spec name (default: the source stem)")
     kg.add_argument("--dest", help="override [kernelgen].dest, relative to repos.sandbox")
     kg.add_argument("--generator", help="host generator class to scrape, when the name "
                                         "doesn't follow <Stem>Generator")
+    kg.add_argument("--dump-sources",
+                    help="prefer an OV_GPU_DUMP_SOURCES_PATH tree when resolving the profiled runtime kernel")
+    kg.add_argument("--profile-dump-dir",
+                    help="read dumped-source metadata from a previous `ckh profile run --out-dir ...`")
+    kg.add_argument("--axis", action="append", metavar="K=v1,v2",
+                    help="record the focused shape axes into the generated spec/tests")
     kg.add_argument("--overwrite", action="store_true",
                     help="replace an existing sandbox kernel of the same name")
     kg.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -691,19 +841,44 @@ def main() -> int:
     pr.set_defaults(fn=cmd_profile)
     pact = pr.add_subparsers(dest="action", required=True)
 
+    pmodel = pact.add_parser("model", help="select the model configured for a pipeline stage")
+    pmodel.add_argument("stage", choices=sorted(clintercept.HARNESS_STAGES),
+                        help="CKH workflow stage")
+
     ps = pact.add_parser("setup", help="find cl_intercept, or install it")
     ps.add_argument("--install", action="store_true", help="download and install if missing")
     ps.add_argument("--from-source", action="store_true", help="build instead of using a release")
+
+    pdet = pact.add_parser("detect", help="argv-only: is this a speculative-decoding pipeline, "
+                           "and where are its main/draft config.json (no cliloader needed)")
+    pdet.add_argument("command", nargs=argparse.REMAINDER,
+                      help="the pipeline command, verbatim, after --")
 
     prun = pact.add_parser("run", help="run a pipeline under cliloader (command after --)")
     prun.add_argument("--out-dir", default="results/profile")
     prun.add_argument("--label", default="run")
     prun.add_argument("--repeat", type=int, default=2,
                       help="cl_intercept adds its own overhead; one run cannot show it is stable")
+    prun.add_argument("--dump-sources",
+                      help="override OV_GPU_DUMP_SOURCES_PATH; default is <out-dir>/ov_gpu_dump_sources")
     prun.add_argument("--no-prompt", action="store_true",
                       help="never ask for the pipeline command; fail instead")
     prun.add_argument("command", nargs=argparse.REMAINDER,
                       help="the pipeline command, verbatim, after --")
+
+    pprep = pact.add_parser("prepare", help="pick a hot kernel from the last/specified profile report and prepare it now")
+    pprep.add_argument("--dump-dir", help="profile out_dir; defaults to the last recorded profile run")
+    pprep.add_argument("--summary", help="explicit profile_summary.json path or a specific run directory")
+    pprep.add_argument("--pick", type=int, default=1,
+                       help="1-based rank inside the chosen bucket (default 1)")
+    pprep.add_argument("--bucket", default="",
+                       help="selection bucket: main_generate, generate, global, etc. Default prefers generate")
+    pprep.add_argument("--name", help="sandbox kernel/spec name override")
+    pprep.add_argument("--dest", help="override [kernelgen].dest, relative to repos.sandbox")
+    pprep.add_argument("--generator", help="host generator class to scrape")
+    pprep.add_argument("--axis", action="append", metavar="K=v1,v2",
+                       help="record the focused shape axes into the generated spec/tests")
+    pprep.add_argument("--overwrite", action="store_true")
 
     prep = pact.add_parser("report", help="per-phase kernel budget + Amdahl ceiling")
     prep.add_argument("--dump-dir", required=True)
@@ -713,10 +888,11 @@ def main() -> int:
     prep.add_argument("--anchor", default="", help="regex marking the generate phase")
     prep.add_argument("--gap-ms", type=float, default=50.0)
     prep.add_argument("--drop-cycles", type=int, default=1)
-    prep.add_argument("--dflash", action="store_true",
-                      help="report dflash pattern groups instead of phase/top-kernel output")
-    prep.add_argument("--dflash-main-config")
-    prep.add_argument("--dflash-draft-config")
+    prep.add_argument("--speculative", action="store_true",
+                      help="report main/draft speculative-decoding pattern groups instead of "
+                           "phase/top-kernel output")
+    prep.add_argument("--speculative-main-config")
+    prep.add_argument("--speculative-draft-config")
 
     for p in (ps, prun, prep):
         p.add_argument("--cli", help="path to cliloader")

@@ -8,7 +8,7 @@ re-learning.
 
 ## Mechanize the task before making it an agent
 
-Before wrapping a task in a `.claude/agents/*.md` (a full subagent invocation), split it into
+Before wrapping a task in a `.github/agents/*.agent.md` role, split it into
 the mechanical part (parsing, templating, a heuristic from a lookup table or a source-text
 substring match) and the part that needs genuine semantic judgment. Script the former; keep
 the agent narrowly scoped to the latter, invoked only as a fallback. `ckh gen-reference` (a

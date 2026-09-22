@@ -17,6 +17,7 @@ from .platform import REPO_ROOT, Platform
 
 RESULTS = REPO_ROOT / "results"
 SNAPSHOTS = REPO_ROOT / "snapshots"
+LAST_PROFILE = RESULTS / ".last_profile.json"
 
 
 # -- pinned sources ------------------------------------------------------------------
@@ -63,3 +64,22 @@ def history(kernel: str, kind: str | None = None) -> list[dict]:
         return []
     recs = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
     return [r for r in recs if kind is None or r["kind"] == kind]
+
+
+def record_last_profile(out_dir: str, dump_sources: str, runs: list[dict]) -> None:
+    RESULTS.mkdir(exist_ok=True)
+    LAST_PROFILE.write_text(json.dumps({
+        "ts": time.strftime("%Y-%m-%d %H:%M"),
+        "out_dir": out_dir,
+        "dump_sources": dump_sources,
+        "runs": runs,
+    }, indent=2))
+
+
+def last_profile() -> dict | None:
+    if not LAST_PROFILE.exists():
+        return None
+    try:
+        return json.loads(LAST_PROFILE.read_text())
+    except json.JSONDecodeError:
+        return None

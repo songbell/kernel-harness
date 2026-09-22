@@ -54,4 +54,4 @@ DEFAULT_AXES = {
 }
 
 # jit/dispatch/args/outputs/SPEC come once a CM kernel exists for this --
-# see .claude/agents/kernel-onboarder.md
+# see .github/agents/ckh-kernel-onboarder.agent.md

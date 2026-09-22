@@ -1,26 +1,30 @@
 # CM kernel optimization — flow and artifacts
 
+The declarative companion for this document is
+`../../workflows/performance-optimization.workflow.yaml`. It binds the current runtime agents
+under `.github/agents/` into a reference-harness-style role graph; this file remains the
+human-readable explanation of the same gates, artifacts, and loop semantics.
+
 ## 1. Pipeline
 
 Each phase's output decides whether the next one is worth running. The gates matter more than
 the boxes: most of the value is in *not* proceeding.
 
 ```
-                     ┌──────────────────────────────────────────────┐
-   task ────────────►│  P  pre-profiler        (target kernel known? │
+         ┌──────────────────────────────────────────────┐
+   task ────────────►│  0  rig-warden / ckh-doctor                 │
+         │     competing GPU work? env? noise floor?    │
+         └──────────────────────┬───────────────────────┘
+       rig not ready ─────┴──► STOP: fix the rig
+               │
+               ▼
+         ┌──────────────────────────────────────────────┐
+         │  P  pre-profiler        (target kernel known? │
                      │     cl_intercept on the REAL pipeline   skip) │
                      │     prefill vs generate · per-kernel share    │
                      └──────────────────────┬───────────────────────┘
                                             │
             share too small ────────────────┴──► STOP: "Amdahl ceiling is N%"
-                                            │
-                                            ▼
-                     ┌──────────────────────────────────────────────┐
-                     │  0  rig-warden                               │
-                     │     competing GPU work? env? noise floor?    │
-                     └──────────────────────┬───────────────────────┘
-                                            │
-                        noise ≥ effect ─────┴──► STOP: "not resolvable on this rig"
                                             │
                                             ▼
                      ┌──────────────────────────────────────────────┐
@@ -64,8 +68,8 @@ the boxes: most of the value is in *not* proceeding.
     ╔═══════════════════════════════════════════════════════════════════════════╗
     ║  4  optimization loop        (one candidate at a time, biggest term first) ║
     ║                                                                           ║
-    ║     bitexact-classifier ──── bit-exact? ──── no ──► ask user               ║
-    ║              │                                      (max_diff DIST,       ║
+    ║     bitexact-classifier ──── bit-exact? ──── no ──► reject-policy          ║
+    ║              │                                      + next candidate      ║
     ║              │ yes                                   not just the max)    ║
     ║              ▼                                                            ║
     ║        implement ──► equivalence-prover ──► measure ──► adopt             ║
@@ -101,8 +105,8 @@ least once in the work this was distilled from.
 
 ```
   aboutSHW/                                    ← versioned: method + kernel + findings
-  ├── .claude/agents/*.md                      the 8 roles
-  ├── .claude/skills/cm-kernel-opt/            SKILL.md + this file
+  ├── .github/agents/*.agent.md               the role definitions used by VS Code
+  ├── docs/                                   OVERVIEW.md + this file + KERNEL_ONBOARDING.md
   ├── opencl/tests/pageatten/
   │   ├── harness/                             bench_paired · kernel_probe
   │   │   ├── sync.sh                          equiv_template · bench_reduce
@@ -116,8 +120,8 @@ least once in the work this was distilled from.
       ├── pa_small_q_finalization.cm
       └── paged_attention{,_gen}.{cpp,hpp}     host policy, rung table
   │
+  workflows/                                   ← versioned: declarative role graph
   /home/intel/ceciliapeng/kernel_harness/      ← NOT versioned (sync target, derived)
-  /home/intel/bell/.claude/{agents,skills}     ← NOT versioned (symlinks, for discovery)
 ```
 
 Two rules keep this from rotting:
@@ -149,15 +153,15 @@ provisional: it drifts ~2x within a session.
 
 ```mermaid
 flowchart TD
-    T[task] --> P[P pre-profiler: cl_intercept e2e]
+  T[task] --> W[0 rig-warden / ckh-doctor]
+  W -->|rig not ready| STOP[STOP: fix the rig]
+  W --> P[P pre-profiler: cl_intercept e2e]
     P -->|kernel share too small| STOP2[STOP: Amdahl ceiling]
     P --> KG{sandbox kernel exists?}
     KG -->|no| GEN[ckh kernelgen: plugin .cm to sandbox]
-    KG -->|yes| W[0 rig-warden]
-    GEN --> W
-    T -->|target kernel already fixed| W
-    W -->|noise >= effect| STOP[STOP: not resolvable]
-    W --> R[1 roofline-analyst]
+    KG -->|yes| R[1 roofline-analyst]
+    GEN --> R
+    W -->|target kernel already fixed| R
     R -->|gap < 1.2x| A[2 algorithm-critic]
     R -->|gap > 3x| A
     R -->|gap 1.5-3x| B[3 budget-prober]
@@ -166,8 +170,7 @@ flowchart TD
     R --> KPF
     B --> L{4 loop: per candidate}
     L --> C[bitexact-classifier]
-    C -->|not bit-exact| U[ask user: max_diff distribution]
-    U --> I[implement]
+    C -->|not bit-exact| U[reject-policy + next candidate]
     C -->|bit-exact| I
     I --> E[equivalence-prover]
     E -->|vacuous| E2[fix the test] --> E
